@@ -122,22 +122,22 @@ const overpassMono = Overpass_Mono({
 const DESCRIPTION =
   'A real internet radio station. Single Icecast stream — every listener hears the same broadcast at the same time, picked and announced by an LLM-driven DJ.';
 
-const SOCIAL_TITLE = 'SUB/WAVE — A real internet radio station';
-const OG_IMAGE_ALT = 'SUB/WAVE — a real internet radio station';
+const SOCIAL_TITLE = 'nightshift radio — A real internet radio station';
+const OG_IMAGE_ALT = 'nightshift radio — a real internet radio station';
 
 // WebSite + Organization give search engines the canonical name/logo.
 const SITE_JSONLD = [
   {
     '@context': 'https://schema.org',
     '@type': 'WebSite',
-    name: 'SUB/WAVE',
+    name: 'nightshift radio',
     url: SITE_URL,
     description: DESCRIPTION,
   },
   {
     '@context': 'https://schema.org',
     '@type': 'Organization',
-    name: 'SUB/WAVE',
+    name: 'nightshift radio',
     url: SITE_URL,
     logo: `${SITE_URL}/icons/512`,
   },
@@ -149,21 +149,21 @@ const SITE_JSONLD = [
 // those URLs to localhost. Hand-written <meta> tags are emitted verbatim.
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
-  title: { default: 'SUB/WAVE', template: '%s · SUB/WAVE' },
+  title: { default: 'nightshift radio', template: '%s · nightshift radio' },
   description: DESCRIPTION,
-  applicationName: 'SUB/WAVE',
+  applicationName: 'nightshift radio',
   // Android picks these up via manifest.js; iOS still needs the
   // `apple-mobile-web-app-*` metas.
   appleWebApp: {
     capable: true,
-    title: 'SUB/WAVE',
+    title: 'nightshift radio',
     statusBarStyle: 'black-translucent',
   },
   formatDetection: { telephone: false },
   openGraph: {
     title: SOCIAL_TITLE,
     description: DESCRIPTION,
-    siteName: 'SUB/WAVE',
+    siteName: 'nightshift radio',
     type: 'website',
   },
   twitter: {

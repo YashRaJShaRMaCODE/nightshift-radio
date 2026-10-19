@@ -8,10 +8,10 @@ export default function manifest(): MetadataRoute.Manifest {
     // Pinned so changing start_url later doesn't make the browser treat this as
     // a different PWA and ship a duplicate home-screen icon.
     id: '/',
-    name: 'SUB/WAVE',
-    short_name: 'SUB/WAVE',
+    name: 'nightshift radio',
+    short_name: 'nightshift',
     description:
-      'Personal internet radio — single live stream, AI DJ between tracks.',
+      'Your late-night companion: 24/7 Punjabi radio with a DJ who never clocks out.',
     start_url: '/',
     scope: '/',
     display: 'standalone',
@@ -35,14 +35,14 @@ export default function manifest(): MetadataRoute.Manifest {
         sizes: '1280x720',
         type: 'image/png',
         form_factor: 'wide',
-        label: 'SUB/WAVE player — now playing on the broadcast',
+        label: 'nightshift radio player — now playing on the broadcast',
       },
       {
         src: '/screenshots/narrow',
         sizes: '720x1280',
         type: 'image/png',
         form_factor: 'narrow',
-        label: 'SUB/WAVE on mobile',
+        label: 'nightshift radio on mobile',
       },
     ],
   };

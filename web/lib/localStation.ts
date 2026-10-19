@@ -163,7 +163,8 @@ class LocalStation {
   private onState(deck: number, s: number) {
     if (deck !== this.live) return;
     const S = this.yt!.PlayerState;
-    if (s === S.PLAYING) { this.status = 'playing'; this.onPlaying(); }
+    if (s === S.PLAYING) { this.status = 'playing'; this.onPlaying(); this.keepAwake(); this.clearBuffering(); }
+    else if (s === S.BUFFERING) this.watchBuffering();
     else if (s === S.PAUSED && !this.fading && !this.userPaused && this.status !== 'idle') {
       // Paused from the TV itself (a click on the video): it's live radio, so resume where the broadcast is now.
       const sl = this.slot(), p = this.player as unknown as { seekTo(t: number, a: boolean): void; playVideo(): void };
@@ -299,6 +300,21 @@ class LocalStation {
     await this.crossTo(this.slot().id, this.slot().offset, false);
   }
   private userPaused = false;
+  // Keep the screen (and with it the tab) awake while the station is on air.
+  private wake: { release(): Promise<void> } | null = null;
+  private keepAwake() {
+    const wl = (navigator as Navigator & { wakeLock?: { request(t: 'screen'): Promise<{ release(): Promise<void> }> } }).wakeLock;
+    if (!wl || this.wake) return;
+    wl.request('screen').then(l => { this.wake = l; }).catch(() => {});
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && this.status === 'playing') { this.wake = null; this.keepAwake(); } }, { once: true });
+  }
+  // Slow network: say so on the booth log instead of leaving an awkward silence.
+  private bufTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchBuffering() {
+    if (this.bufTimer || this.fading) return;
+    this.bufTimer = setTimeout(() => { void this.say("Signal's a little weak right now. Hang tight, the music's coming back.", false); }, 4000);
+  }
+  private clearBuffering() { if (this.bufTimer) { clearTimeout(this.bufTimer); this.bufTimer = null; } }
   play() { this.userPaused = false; this.player?.playVideo(); }
   pause() { this.userPaused = true; this.player?.pauseVideo(); this.status = 'paused'; this.emit(); }
   stop() {
@@ -307,6 +323,7 @@ class LocalStation {
     if (this.boundary) clearTimeout(this.boundary);
     if (this.preroll) clearTimeout(this.preroll);
     if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+    this.wake?.release().catch(() => {}); this.wake = null; this.clearBuffering();
     this.status = 'idle'; this.current = null; this.emit();
   }
   setVolume(v: number) { this.volume = Math.max(0, Math.min(1, v)); this.decks.forEach((_, i) => this.setDeckVol(i, this.deckVol[i] ?? 1)); this.save(); this.emit(); }
