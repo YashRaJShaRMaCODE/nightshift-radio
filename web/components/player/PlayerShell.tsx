@@ -9,6 +9,7 @@ import { useThemeSwitcher } from '@/components/ThemeProvider';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { cn } from '@/lib/cn';
 import MoodPicker from './MoodPicker';
+import NsExtras from './NsExtras';
 import {
   cacheStationSkin,
   loadCachedStationSkin,
@@ -152,6 +153,7 @@ function ShellChrome({ skin, contained }: { skin?: SkinComponent; contained: boo
               <MoodPicker />
               <div id="ns-tv-screen" className="h-[200px] w-[200px] overflow-hidden rounded-lg bg-black" />
               <div className="mt-1.5 font-mono text-[10px] tracking-[3px] text-muted uppercase">NS-TV · CH 03</div>
+              <NsExtras />
             </div>
             {/* Contain skin suspension here so the landing page does not replay its reveal and remain at opacity 0. */}
             <Suspense fallback={null}>

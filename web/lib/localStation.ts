@@ -38,6 +38,8 @@ const moodList = (m: string): NsSong[] => {
   const list = [...new Set(ids)].filter(id => LIB.songs[id]).map(id => ({ id, d: LIB.songs[id]! }));
   return list.length ? list : Object.entries(LIB.songs).map(([id, d]) => ({ id, d }));
 };
+const MOOD_THEME: Record<string, string> = { sad: 'blueprint', bhangra: 'flare', sufi: 'vinyl', lofi: 'classic-dark', night: 'cyberpunk',
+  romantic: 'classic-light', retro: 'recon', rap: 'signal', gym: 'flare', wedding: 'vinyl', drive: 'cyberpunk', trending: 'classic-dark', mine: 'classic-dark' };
 export const moodLabel = (m: string) => MOODS.find(x => x[0] === m)?.[1] ?? 'Trending';
 
 // stationSongs.json: ~680 Punjabi hits harvested once from public YouTube playlists.
@@ -70,7 +72,9 @@ const LINES: Record<string, string[]> = {
 interface Song { title: string; likes: number; plays: number }
 interface Saved { songs: Record<string, Song>; banned: string[]; seeded?: boolean; volume?: number; seedIds?: string[]; mood?: string;
   /** My Station: songs from the listener's own playlists, and YouTube Mix picks grown from their likes. */
-  mine?: string[]; mix?: string[] }
+  mine?: string[]; mix?: string[];
+  /** Listening log for history and Wrapped: song id, start time, mood, seconds heard. */
+  log?: { id: string; at: number; mood: string; s: number }[]; autoMood?: boolean }
 const KEY = 'nightshift-radio';
 const load = (): Saved => { try { return { songs: {}, banned: [], ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch { return { songs: {}, banned: [] }; } };
 
@@ -230,13 +234,26 @@ class LocalStation {
     const { title, artist } = parseTitle(song.title);
     if (!this.current!.startedAt) {
       this.current = { ...this.current!, title, artist, startedAt: iso(), duration: p.getDuration() || undefined };
-      song.plays++; this.save();
+      song.plays++;
+      const log = (this.saved.log ??= []); const last = log[log.length - 1];
+      if (last) last.s = Math.min(last.s || 0, Math.round((Date.now() - last.at) / 1000)) || Math.round((Date.now() - last.at) / 1000);
+      log.push({ id, at: Date.now(), mood: this.mood, s: 0 });
+      this.saved.log = log.filter(x => Date.now() - x.at < 35 * 86400000).slice(-3000); this.save();
       if (this.history[0]?.subsonic_id !== id) this.history.unshift({ title, artist, subsonic_id: id, startedAt: this.current.startedAt });
       this.history = this.history.slice(0, 30);
       this.cue();
       if (this.mood === 'mine' && !this.onRequest) this.arm();
-      if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title, artist, album: STATION_NAME,
-        artwork: [{ src: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' }] });
+      if ('mediaSession' in navigator) {
+        const ms = navigator.mediaSession;
+        ms.metadata = new MediaMetadata({ title, artist: artist || moodLabel(this.mood), album: `${STATION_NAME} · ${moodLabel(this.mood)}`,
+          artwork: [{ src: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' },
+            { src: `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`, sizes: '1280x720', type: 'image/jpeg' }] });
+        ms.playbackState = 'playing';
+        ms.setActionHandler('play', () => void this.tune());
+        ms.setActionHandler('pause', () => this.pause());
+        ms.setActionHandler('nexttrack', () => void this.next());
+        ms.setActionHandler('stop', () => this.stop());
+      }
     } else if (!this.current!.title) this.current = { ...this.current!, title, artist };
   }
 
@@ -358,7 +375,8 @@ class LocalStation {
     this.setDeckVol(to, 0);
     this.live = to; this.load(to, id, at);
     this.showDeck(to);
-    const text = line ?? (talk ? await Promise.race([this.djLine(prev, id), new Promise<string>(r => setTimeout(() => r(this.link(prev, id)), 1800))]) : '');
+    if (talk) this.applyAutoMood();
+    const text = line ?? (talk ? this.takeDedication() + await Promise.race([this.djLine(prev, id), new Promise<string>(r => setTimeout(() => r(this.link(prev, id)), 1800))]) : '');
     const talking = text ? this.say(text) : Promise.resolve();
     await Promise.all([this.ramp(from, 0, talk ? 2600 : 1200), this.ramp(to, text ? 0.4 : 1, talk ? 2200 : 1200)]);
     this.decks[from]?.stopVideo(); this.fading = false;
@@ -388,6 +406,72 @@ class LocalStation {
     this.bufTimer = setTimeout(() => { void this.say("Signal's a little weak right now. Hang tight, the music's coming back.", false); }, 4000);
   }
   private clearBuffering() { if (this.bufTimer) { clearTimeout(this.bufTimer); this.bufTimer = null; } }
+  // ---------- extras: dedications, sleep/alarm, auto mood, lyrics, history, wrapped ----------
+  private dedication = '';
+  dedicate(text: string) { this.dedication = text.trim().slice(0, 140); void this.say(`Got your dedication. It goes out with the next song.`, false); }
+  private takeDedication() { const d = this.dedication; this.dedication = ''; return d ? `This next one is a dedication: ${d}. ` : ''; }
+
+  sleepAt: number | null = null;
+  private sleepT: ReturnType<typeof setTimeout> | null = null;
+  sleep(min: number) {
+    if (this.sleepT) clearTimeout(this.sleepT);
+    this.sleepAt = min > 0 ? Date.now() + min * 60000 : null; this.emit();
+    if (min > 0) this.sleepT = setTimeout(() => { void this.say('Sleep timer. Good night from nightshift radio.', true).then(() => this.stop()); this.sleepAt = null; }, min * 60000);
+  }
+  alarmAt: string | null = null;
+  private alarmT: ReturnType<typeof setTimeout> | null = null;
+  /** Wake-up at HH:MM (local time) into Morning-friendly Trending. Needs this tab left open. */
+  alarm(hhmm: string | null) {
+    if (this.alarmT) clearTimeout(this.alarmT);
+    this.alarmAt = hhmm; this.emit();
+    if (!hhmm) return;
+    const [h, m] = hhmm.split(':').map(Number); const t = new Date(); t.setHours(h ?? 7, m ?? 0, 0, 0);
+    if (t.getTime() <= Date.now()) t.setDate(t.getDate() + 1);
+    this.alarmT = setTimeout(() => { this.alarmAt = null; this.setVolume(Math.max(this.volume, 0.6)); this.setMood('trending'); void this.tune(); }, t.getTime() - Date.now());
+  }
+
+  get autoMood() { return !!this.saved.autoMood; }
+  setAutoMood(on: boolean) { this.saved.autoMood = on; this.save(); this.emit(); if (on) this.applyAutoMood(); }
+  /** Rain means lo-fi, small hours mean Late Night, and so on. Checked on every handover. */
+  private applyAutoMood() {
+    if (!this.saved.autoMood) return;
+    const h = hourNow(), wet = /rain|storm|snow/.test(this.weather.condition ?? '');
+    const m = wet ? 'lofi' : h < 5 ? 'night' : h < 7 ? 'sufi' : h < 9 ? 'gym' : h < 12 ? 'trending' : h < 17 ? 'lofi' : h < 21 ? 'drive' : 'romantic';
+    if (m !== this.mood) this.setMood(m);
+  }
+  themeId() { return MOOD_THEME[this.mood] ?? 'classic-dark'; }
+
+  private lyricCache = new Map<string, { t: number; l: string }[] | null>();
+  /** Time-synced lyrics from LRCLIB (free, no key); plain lyrics come back untimed. */
+  async lyrics(id: string): Promise<{ t: number; l: string }[] | null> {
+    if (this.lyricCache.has(id)) return this.lyricCache.get(id)!;
+    const { title, artist } = parseTitle(this.saved.songs[id]?.title);
+    if (!title) return null;
+    try {
+      const r = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(`${title} ${artist}`.trim())}`, { signal: AbortSignal.timeout(6000) });
+      const hits = (await r.json()) as { syncedLyrics?: string; plainLyrics?: string }[];
+      const hit = hits.find(x => x.syncedLyrics) ?? hits.find(x => x.plainLyrics);
+      const lines = hit?.syncedLyrics
+        ? hit.syncedLyrics.split('\n').map(x => { const m = x.match(/^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$/); return m ? { t: Number(m[1]) * 60 + Number(m[2]), l: m[3] ?? '' } : null; }).filter((x): x is { t: number; l: string } => !!x && !!x.l)
+        : hit?.plainLyrics ? hit.plainLyrics.split('\n').filter(Boolean).map(l => ({ t: -1, l })) : null;
+      this.lyricCache.set(id, lines?.length ? lines : null);
+    } catch { return null; }
+    return this.lyricCache.get(id) ?? null;
+  }
+  get currentId() { return this.current?.id ?? null; }
+  title(id: string) { return parseTitle(this.saved.songs[id]?.title); }
+
+  history24() { return (this.saved.log ?? []).filter(x => Date.now() - x.at < 86400000).slice().reverse(); }
+  wrapped(days = 7) {
+    const log = (this.saved.log ?? []).filter(x => Date.now() - x.at < days * 86400000);
+    const secs = log.reduce((t, x, i) => t + (x.s || (i === log.length - 1 ? Math.round((Date.now() - x.at) / 1000) : 150)), 0);
+    const top = (f: (x: (typeof log)[number]) => string) => { const c = new Map<string, number>(); log.forEach(x => { const k = f(x); if (k) c.set(k, (c.get(k) ?? 0) + 1); });
+      return [...c.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? ''; };
+    const topId = top(x => x.id);
+    return { songs: log.length, hours: Math.round((secs / 3600) * 10) / 10, minutes: Math.round(secs / 60), artist: top(x => this.title(x.id).artist), mood: moodLabel(top(x => x.mood)),
+      song: topId ? this.title(topId).title : '' };
+  }
+
   play() { void this.tune(); }
   pause() { this.userPaused = true; this.status = 'paused'; this.emit(); const i = this.live; void this.ramp(i, 0, 350).then(() => { if (this.userPaused) this.decks[i]?.pauseVideo(); }); }
   stop() {

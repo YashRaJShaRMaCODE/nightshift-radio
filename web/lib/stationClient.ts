@@ -97,7 +97,7 @@ export function createStationClient(origin: StationOrigin): StationClient {
     session: () => ok(station.session()),
     health: () => ok(new Response('ok', { status: 200 })),
     schedule: () => ok(station.schedule()),
-    themes: () => ok({ active: 'classic-dark', activeSource: 'station' as const, stationDefault: 'classic-dark', activeShow: null, themes: THEMES }),
+    themes: () => ok({ active: station.themeId(), activeSource: 'show' as const, stationDefault: 'classic-dark', activeShow: null, themes: THEMES }),
     submitRequest: text => ok(station.request(text)),
     requestStatus: id => ok(station.requestStatus(id)),
     likeCurrent: id => ok(station.like(id)),
