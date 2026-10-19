@@ -8,6 +8,7 @@ watch page is then read for its length and whether its owner allows embedding; b
 are dropped so the station never stalls on them.
 """
 import json
+import time
 import re
 import sys
 import urllib.request
@@ -28,6 +29,10 @@ MOODS = {
     "wedding": ["PL-FunsM0ZBoA6Axq3wt8Mr1LWvodFrYCe"],
     "sufi": ["PL4ZJnEUgawnTFBopyqmkfdN4RHZl9elbf", "PLqMtStrmKvO9mqk_LTyBAtka8KMYMJbwg"],
     "drive": ["PLvWfwCPLBQ5-OfZBJFlqTd6yyJqn0wMDJ", "PLHvybnsTYyfX336Tn6Pych7U_uDuMNZIL"],
+    "haryanvi": ["PLeMt84V2r-u-O7pyuY3o8ocJpvhk0caUi", "PL78VkdACg9wzNYNmdUbCkvGu6IQu0QzvX", "PL3RMrwAhqFtZZztewmlpDvtYcwOOBmZZ0"],
+    "english": ["PL3oW2tjiIxvSoyqkKFBJ5gctW9pnBy6Yn", "PL3oW2tjiIxvQcljtDpKQVNhAfK-vsZkV_", "PLR5L9iRTwxbZtuupVmMh5ZMfJ-B05uTwL"],
+    "bollywood": ["PLw-VjHDlEOgvh3fIZ8VSWWE09eYGO8uFI", "PLO7-VO1D0_6NmK47v6tpOcxurcxdW-hZa", "PL4fXyPNB21BPBL_303vRBbmbac2I9j7qn"],
+    "oldhindi": ["PL4OqLl4qvLkc66m2pNiD0CBRyISex0qwW"],
 }
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126 Safari/537.36",
            "Accept-Language": "en-US,en;q=0.9", "Cookie": "CONSENT=YES+1; SOCS=CAI"}
@@ -46,6 +51,7 @@ def expand(list_id):
 
 def probe(vid):
     """Seconds, or -1 when the video is gone, private or not embeddable."""
+    time.sleep(0.4)
     try:
         req = urllib.request.Request(f"https://www.youtube.com/watch?v={vid}&hl=en", headers=HEADERS)
         html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
@@ -73,8 +79,14 @@ def main(args):
                 got.append(m.group(1))
         ids_by_mood[mood] = list(dict.fromkeys(got))
     every = sorted({i for v in ids_by_mood.values() for i in v})
-    with ThreadPoolExecutor(16) as pool:
-        lengths = dict(zip(every, pool.map(probe, every)))
+    # Durations never change: reuse the ones already on file and only probe new videos, gently.
+    known = json.loads(OUT.read_text(encoding="utf-8")).get("songs", {}) if OUT.exists() else {}
+    todo = [i for i in every if i not in known]
+    print(f"probing {len(todo)} new videos ({len(every) - len(todo)} already known)")
+    with ThreadPoolExecutor(4) as pool:
+        lengths = {**{i: known[i] for i in every if i in known}, **dict(zip(todo, pool.map(probe, todo)))}
+    if todo and all(lengths[i] == -1 for i in todo):
+        sys.exit("every probe failed - YouTube is probably rate-limiting; try again later (nothing written)")
     ok = {i: d for i, d in lengths.items() if 90 <= d <= 600}  # songs, not mixes or shorts
     out = {"songs": ok, "moods": {m: [i for i in v if i in ok] for m, v in ids_by_mood.items()}}
     OUT.write_text(json.dumps(out, separators=(",", ":")), encoding="utf-8")

@@ -30,6 +30,7 @@ export const MOODS: [id: string, label: string][] = [
   ['mine', 'My Station'], ['trending', 'Trending'], ['romantic', 'Romantic'], ['sad', 'Heartbreak'], ['bhangra', 'Bhangra Party'],
   ['gym', 'Gym Mode'], ['lofi', 'Lo-fi Chill'], ['retro', '90s Retro'], ['rap', 'Punjabi Rap'],
   ['wedding', 'Shaadi Season'], ['sufi', 'Sufi Soul'], ['drive', 'Long Drive'], ['night', 'Late Night'],
+  ['haryanvi', 'Haryanvi'], ['english', 'English Hits'], ['bollywood', 'Bollywood'], ['oldhindi', 'Old Hindi'],
 ];
 const LIB = SONGS as { songs: Record<string, number>; moods: Record<string, string[]> };
 const MIXES: Record<string, string[]> = { night: ['lofi', 'romantic', 'sad', 'sufi'] };
@@ -39,7 +40,8 @@ const moodList = (m: string): NsSong[] => {
   return list.length ? list : Object.entries(LIB.songs).map(([id, d]) => ({ id, d }));
 };
 const MOOD_THEME: Record<string, string> = { sad: 'blueprint', bhangra: 'flare', sufi: 'vinyl', lofi: 'classic-dark', night: 'cyberpunk',
-  romantic: 'classic-light', retro: 'recon', rap: 'signal', gym: 'flare', wedding: 'vinyl', drive: 'cyberpunk', trending: 'classic-dark', mine: 'classic-dark' };
+  romantic: 'classic-light', retro: 'recon', rap: 'signal', gym: 'flare', wedding: 'vinyl', drive: 'cyberpunk', trending: 'classic-dark', mine: 'classic-dark',
+  haryanvi: 'flare', english: 'classic-light', bollywood: 'recon', oldhindi: 'vinyl' };
 export const moodLabel = (m: string) => MOODS.find(x => x[0] === m)?.[1] ?? 'Trending';
 
 // stationSongs.json: ~680 Punjabi hits harvested once from public YouTube playlists.
