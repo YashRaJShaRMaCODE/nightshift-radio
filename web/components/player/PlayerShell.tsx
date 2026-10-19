@@ -8,8 +8,7 @@ import { toast } from 'sonner';
 import { useThemeSwitcher } from '@/components/ThemeProvider';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { cn } from '@/lib/cn';
-import MoodPicker from './MoodPicker';
-import NsExtras from './NsExtras';
+import TvCard from './TvCard';
 import {
   cacheStationSkin,
   loadCachedStationSkin,
@@ -149,12 +148,7 @@ function ShellChrome({ skin, contained }: { skin?: SkinComponent; contained: boo
         ) : (
           <>
             {/* nightshift: the YouTube player lives in this TV; YouTube requires it to stay visible (>=200x200). */}
-            <div aria-label="Now playing video" className="fixed right-3 bottom-12 z-[60] rounded-xl border border-line bg-bg p-1.5 opacity-90 transition-opacity hover:opacity-100">
-              <MoodPicker />
-              <div id="ns-tv-screen" className="h-[200px] w-[200px] overflow-hidden rounded-lg bg-black" />
-              <div className="mt-1.5 font-mono text-[10px] tracking-[3px] text-muted uppercase">NS-TV · CH 03</div>
-              <NsExtras />
-            </div>
+            <TvCard />
             {/* Contain skin suspension here so the landing page does not replay its reveal and remain at opacity 0. */}
             <Suspense fallback={null}>
               <Skin contained={contained} portalNode={portalNode} />

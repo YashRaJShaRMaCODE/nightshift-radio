@@ -134,10 +134,19 @@ function Wrapped() {
 
 export default function NsExtras() {
   const [tab, setTab] = useState<Tab>(null);
+  const root = useRef<HTMLDivElement>(null);
+  // Close the open panel on a click anywhere outside it, or on Escape.
+  useEffect(() => {
+    if (!tab) return;
+    const out = (e: PointerEvent) => { if (!root.current?.contains(e.target as Node)) setTab(null); };
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setTab(null); };
+    document.addEventListener('pointerdown', out); document.addEventListener('keydown', esc);
+    return () => { document.removeEventListener('pointerdown', out); document.removeEventListener('keydown', esc); };
+  }, [tab]);
   const [, force] = useState(0);
   useEffect(() => station.subscribe(() => force(n => n + 1)), []);
   return (
-    <div className="relative z-30 mt-1.5 font-mono text-[10px] tracking-[1px] text-muted">
+    <div ref={root} className="relative z-30 mt-1.5 font-mono text-[10px] tracking-[1px] text-muted">
       {tab && (
         <div className="absolute right-0 bottom-full z-30 mb-2 w-72 rounded-xl border border-line bg-bg p-3 text-[11px] normal-case shadow-xl">
           {tab === 'search' && <Search />}{tab === 'lyrics' && <Lyrics />}{tab === 'dedicate' && <Dedicate />}{tab === 'timer' && <Timer />}

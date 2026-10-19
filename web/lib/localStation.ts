@@ -81,10 +81,15 @@ const KEY = 'nightshift-radio';
 const load = (): Saved => { try { return { songs: {}, banned: [], ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch { return { songs: {}, banned: [] }; } };
 
 // ---------- helpers ----------
-export function parseTitle(t = '') {
+/** "Artist - Song" or "Song - Artist"? Featured credits and the channel name decide which side is the artist. */
+export function parseTitle(t = '', channel = '') {
   const clean = t.replace(/\s*[([].*?(official|video|audio|lyric|4k|hd|full song|latest|new punjabi).*?[)\]]/gi, '').replace(/\s*\|.*$/, '').trim();
   const parts = clean.split(/\s[-–]\s/);
-  return parts.length > 1 ? { artist: (parts[0] ?? '').trim(), title: parts.slice(1).join(' - ').trim() } : { artist: '', title: clean };
+  if (parts.length < 2) return { artist: '', title: clean };
+  const [a, b] = [parts[0]!.trim(), parts.slice(1).join(' - ').trim()];
+  const ch = channel.toLowerCase().replace(/\s*(official|music|records|vevo|- topic)\s*/g, '').trim();
+  const looksArtist = (x: string) => /\b(?:ft|feat)\b\.?|\bx\b|&/i.test(x) || (!!ch && x.toLowerCase().includes(ch));
+  return looksArtist(b) && !looksArtist(a) ? { artist: b, title: a } : { artist: a, title: b };
 }
 const iso = (ms = Date.now()) => new Date(ms).toISOString();
 
@@ -233,7 +238,7 @@ class LocalStation {
     if (!id) return;
     const song = (this.saved.songs[id] ??= { title: '', likes: 0, plays: 0 });
     if (d.title && song.title !== d.title) { song.title = d.title; this.save(); }
-    const { title, artist } = parseTitle(song.title);
+    const { title, artist } = parseTitle(song.title, (d as { author?: string }).author);
     if (!this.current!.startedAt) {
       this.current = { ...this.current!, title, artist, startedAt: iso(), duration: p.getDuration() || undefined };
       song.plays++;
