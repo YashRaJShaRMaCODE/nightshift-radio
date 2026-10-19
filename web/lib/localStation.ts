@@ -83,12 +83,12 @@ const load = (): Saved => { try { return { songs: {}, banned: [], ...JSON.parse(
 // ---------- helpers ----------
 /** "Artist - Song" or "Song - Artist"? Featured credits and the channel name decide which side is the artist. */
 export function parseTitle(t = '', channel = '') {
-  const clean = t.replace(/\s*[([].*?(official|video|audio|lyric|4k|hd|full song|latest|new punjabi).*?[)\]]/gi, '').replace(/\s*\|.*$/, '').trim();
-  const parts = clean.split(/\s[-–]\s/);
-  if (parts.length < 2) return { artist: '', title: clean };
+  const clean = t.replace(/\s*[([].*?(official|offical|video|audio|visuali[sz]er|lyric|4k|hd|full song|latest|new punjabi).*?[)\]]/gi, '').replace(/\s*\|.*$/, '').trim();
+  const parts = clean.split(/\s[-–]\s/).filter(x => !/^(official|offical)?\s*(music\s*)?(video|audio|visualizer|lyrics?)$/i.test(x.trim()));
+  if (parts.length < 2) return { artist: '', title: (parts[0] ?? clean).trim() };
   const [a, b] = [parts[0]!.trim(), parts.slice(1).join(' - ').trim()];
   const ch = channel.toLowerCase().replace(/\s*(official|music|records|vevo|- topic)\s*/g, '').trim();
-  const looksArtist = (x: string) => /\b(?:ft|feat)\b\.?|\bx\b|&/i.test(x) || (!!ch && x.toLowerCase().includes(ch));
+  const looksArtist = (x: string) => /\b(?:ft|feat)\b\.?|\bx\b|&|,/i.test(x) || (!!ch && x.toLowerCase().includes(ch));
   return looksArtist(b) && !looksArtist(a) ? { artist: b, title: a } : { artist: a, title: b };
 }
 const iso = (ms = Date.now()) => new Date(ms).toISOString();
