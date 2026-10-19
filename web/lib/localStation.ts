@@ -10,7 +10,7 @@ import type { Theme } from '@/lib/theme';
 import type {
   NowPlayingResponse, QueueEntry, RequestResult, SchedulePayload, SessionPayload, SessionTurn, StationState,
 } from '@/lib/types';
-import { onAir, type Song as NsSong } from './nsSchedule';
+import { TAIL, onAir, type Song as NsSong } from './nsSchedule';
 import SONGS from './stationSongs.json';
 import blueprint from './themes/blueprint.json';
 import classicDark from './themes/classic-dark.json';
@@ -27,7 +27,7 @@ const TZ = 'Asia/Kolkata';
 
 // ---------- mood stations: each one is its own synced broadcast ----------
 export const MOODS: [id: string, label: string][] = [
-  ['trending', 'Trending'], ['romantic', 'Romantic'], ['sad', 'Heartbreak'], ['bhangra', 'Bhangra Party'],
+  ['mine', 'My Station'], ['trending', 'Trending'], ['romantic', 'Romantic'], ['sad', 'Heartbreak'], ['bhangra', 'Bhangra Party'],
   ['gym', 'Gym Mode'], ['lofi', 'Lo-fi Chill'], ['retro', '90s Retro'], ['rap', 'Punjabi Rap'],
   ['wedding', 'Shaadi Season'], ['sufi', 'Sufi Soul'], ['drive', 'Long Drive'], ['night', 'Late Night'],
 ];
@@ -68,7 +68,9 @@ const LINES: Record<string, string[]> = {
 
 // ---------- saved taste ----------
 interface Song { title: string; likes: number; plays: number }
-interface Saved { songs: Record<string, Song>; banned: string[]; seeded?: boolean; volume?: number; seedIds?: string[]; mood?: string }
+interface Saved { songs: Record<string, Song>; banned: string[]; seeded?: boolean; volume?: number; seedIds?: string[]; mood?: string;
+  /** My Station: songs from the listener's own playlists, and YouTube Mix picks grown from their likes. */
+  mine?: string[]; mix?: string[] }
 const KEY = 'nightshift-radio';
 const load = (): Saved => { try { return { songs: {}, banned: [], ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch { return { songs: {}, banned: [] }; } };
 
@@ -105,7 +107,6 @@ class LocalStation {
   private saved: Saved = { songs: {}, banned: [] };
   private yt: YTNs | null = null;
   private subs = new Set<() => void>();
-  private mix: string[] = [];
   status: EngineStatus = 'idle';
   volume = 0.8;
   current: (QueueEntry & { id: string; duration?: number }) | null = null;
@@ -141,7 +142,11 @@ class LocalStation {
   setMood(m: string) {
     if (m === this.mood || !MOODS.some(x => x[0] === m)) return;
     this.mood = m; this.saved.mood = m; this.save(); this.upcoming = []; this.emit();
-    if (this.status !== 'idle' && this.decks.length) { const sl = this.slot(); void this.crossTo(sl.id, sl.offset, false, `Switching to ${moodLabel(m)}.`); }
+    if (this.status !== 'idle' && this.decks.length) {
+      const sl = this.slot(), at = m === 'mine' ? 0 : sl.offset;
+      const hint = m === 'mine' && !this.minePool().length ? ' Paste your own playlist link in Request, or tap Keep on songs you love, and this becomes yours.' : '';
+      void this.crossTo(sl.id, at, false, `Switching to ${moodLabel(m)}.${hint}`);
+    }
   }
   subscribe(fn: () => void) { this.subs.add(fn); return () => { this.subs.delete(fn); }; }
   private emit() { this.subs.forEach(f => f()); }
@@ -229,6 +234,7 @@ class LocalStation {
       if (this.history[0]?.subsonic_id !== id) this.history.unshift({ title, artist, subsonic_id: id, startedAt: this.current.startedAt });
       this.history = this.history.slice(0, 30);
       this.cue();
+      if (this.mood === 'mine' && !this.onRequest) this.arm();
       if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title, artist, album: STATION_NAME,
         artwork: [{ src: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' }] });
     } else if (!this.current!.title) this.current = { ...this.current!, title, artist };
@@ -277,7 +283,33 @@ class LocalStation {
   }
 
   // ---------- shared clock: every listener hears the same song at the same moment ----------
+  // ---------- My Station: personal, taste-driven, plays each song to its real end ----------
+  private minePool(): string[] {
+    const liked = Object.entries(this.saved.songs).filter(([, v]) => v.likes > 0).map(([id]) => id);
+    return [...new Set([...(this.saved.mine ?? []), ...liked, ...(this.saved.mix ?? [])])].filter(id => !this.saved.banned.includes(id));
+  }
+  private mineNext = '';
+  private pickMine(): string {
+    const recent = new Set(this.history.slice(0, 12).map(h => h.subsonic_id).concat(this.current?.id ?? ''));
+    const pool = this.minePool().filter(id => !recent.has(id));
+    if (!pool.length) return onAir(moodList('trending'), this.now(), 2)?.next ?? 'kJQP7kiw5Fk';
+    // Your own playlists and likes weigh more than fresh Mix discoveries.
+    const own = new Set([...(this.saved.mine ?? []), ...Object.keys(this.saved.songs).filter(id => (this.saved.songs[id]?.likes ?? 0) > 0)]);
+    const w = (id: string) => (own.has(id) ? 3 : 1) + (this.saved.songs[id]?.likes ?? 0) * 2;
+    let r = Math.random() * pool.reduce((t, id) => t + w(id), 0);
+    for (const id of pool) if ((r -= w(id)) <= 0) return id;
+    return pool[0]!;
+  }
+  private mineLeft() {
+    const p = this.player as unknown as { getDuration?(): number; getCurrentTime?(): number } | null;
+    const d = p?.getDuration?.() || 0, t = p?.getCurrentTime?.() || 0;
+    return d > 0 ? Math.max(1500, (d - TAIL - t) * 1000) : 240000;
+  }
   private slot() {
+    if (this.mood === 'mine') {
+      if (!this.mineNext) this.mineNext = this.pickMine();
+      return { id: this.mineNext, next: this.mineNext, offset: 0, msLeft: this.mineLeft(), nextD: 0, index: 0 };
+    }
     const salt = MOODS.findIndex(x => x[0] === this.mood) + 1;
     const a = onAir(moodList(this.mood), this.now(), salt);
     return a ?? { id: 'kJQP7kiw5Fk', next: 'kJQP7kiw5Fk', offset: 0, msLeft: 180000, nextD: 180, index: 0 };
@@ -297,11 +329,12 @@ class LocalStation {
     if (resume && this.onRequest) { p.playVideo(); void this.ramp(this.live, 1, 600); return; }
     const sl = this.slot();
     this.setDeckVol(this.live, 0);
-    this.load(this.live, sl.id, sl.offset + 0.4);
+    this.load(this.live, sl.id, this.mood === 'mine' ? 0 : sl.offset + 0.4);
     void this.ramp(this.live, 1, 1500);
     this.arm();
   }
   private load(deck: number, id: string, at: number) {
+    if (id === this.mineNext) this.mineNext = '';
     this.current = { id, subsonic_id: id }; this.onRequest = false; this.emit();
     (this.decks[deck] as unknown as { loadVideoById(o: { videoId: string; startSeconds: number }): void }).loadVideoById({ videoId: id, startSeconds: Math.floor(at) });
   }
@@ -336,6 +369,7 @@ class LocalStation {
   async next(_talk = false) {
     const req = this.upcoming.find(x => x !== this.slot().next);
     if (req) { this.upcoming = this.upcoming.filter(x => x !== req); await this.crossTo(req, 0, true); this.onRequest = true; return; }
+    if (this.mood === 'mine') { await this.crossTo(this.pickMine(), 0, false); return; }
     const sl = this.slot(); await this.crossTo(sl.id, sl.offset, false);
   }
   private userPaused = false;
@@ -371,7 +405,10 @@ class LocalStation {
   like(songId: string) {
     const s = this.saved.songs[songId]; if (!s) return { ok: false, error: 'no track' };
     s.likes++; this.save();
-    this.harvest('RD' + songId).then(ids => { this.mix = ids.filter(x => x !== songId && !this.saved.banned.includes(x)).slice(0, 15); });
+    this.harvest('RD' + songId).then(ids => {
+      const fresh = ids.filter(x => x !== songId && !this.saved.banned.includes(x)).slice(0, 25);
+      this.saved.mix = [...new Set([...fresh, ...(this.saved.mix ?? [])])].slice(0, 500); this.save();
+    });
     return { ok: true, songId, liked: true, count: s.likes };
   }
   likeStatus() { const id = this.current?.id; return { enabled: true, songId: id ?? null, liked: !!(id && this.saved.songs[id]?.likes), count: id ? this.saved.songs[id]?.likes ?? 0 : 0 }; }
@@ -381,11 +418,13 @@ class LocalStation {
     const id = text.match(/(?:v=|youtu\.be\/|shorts\/)([\w-]{11})/)?.[1], list = text.match(/list=([\w-]+)/)?.[1];
     let res: RequestResult;
     if (id) {
-      this.saved.songs[id] ??= { title: '', likes: 1, plays: 0 }; this.upcoming.unshift(id); this.save();
+      this.saved.songs[id] ??= { title: '', likes: 1, plays: 0 }; this.upcoming.unshift(id);
+      this.saved.mine = [...new Set([...(this.saved.mine ?? []), id])]; this.save();
       res = { success: true, status: 'resolved', requestId, requestText: text, ack: 'Got it. That one is up next.', queuePosition: 1, track: { subsonic_id: id, title: 'Your request' } };
     } else if (list) {
-      void this.harvest(list).then(ids => { ids.forEach(x => (this.saved.songs[x] ??= { title: '', likes: 1, plays: 0 })); this.save(); });
-      res = { success: true, status: 'resolved', requestId, requestText: text, ack: 'Playlist added to the library.' };
+      void this.harvest(list).then(ids => { ids.forEach(x => (this.saved.songs[x] ??= { title: '', likes: 0, plays: 0 }));
+        this.saved.mine = [...new Set([...(this.saved.mine ?? []), ...ids])]; this.save(); this.emit(); });
+      res = { success: true, status: 'resolved', requestId, requestText: text, ack: 'Playlist added to My Station.' };
     } else res = { success: false, status: 'failed', requestId, requestText: text, message: 'Paste a YouTube song or playlist link.' };
     this.requests.set(requestId, res);
     return res;
