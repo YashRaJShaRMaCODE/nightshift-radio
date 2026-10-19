@@ -164,7 +164,12 @@ class LocalStation {
     if (deck !== this.live) return;
     const S = this.yt!.PlayerState;
     if (s === S.PLAYING) { this.status = 'playing'; this.onPlaying(); }
-    else if (s === S.PAUSED && this.status === 'playing' && !this.fading) this.status = 'paused';
+    else if (s === S.PAUSED && !this.fading && !this.userPaused && this.status !== 'idle') {
+      // Paused from the TV itself (a click on the video): it's live radio, so resume where the broadcast is now.
+      const sl = this.slot(), p = this.player as unknown as { seekTo(t: number, a: boolean): void; playVideo(): void };
+      if (!this.onRequest && this.current?.id === sl.id) p.seekTo(Math.floor(sl.offset), true);
+      p.playVideo(); return;
+    }
     else if (s === S.ENDED) { this.onEnded(); return; }
     this.emit();
   }
@@ -247,6 +252,7 @@ class LocalStation {
   async tune() {
     this.init(); const resume = !!this.current && this.status === 'paused'; this.status = 'connecting'; this.emit();
     const p = await this.ensurePlayer(); if (!p) return;
+    this.userPaused = false;
     if (resume) { p.playVideo(); return; }
     await this.seeding;
     // One tap and you're in: join the broadcast mid-song with a soft fade-in, no intro chatter.
@@ -292,9 +298,11 @@ class LocalStation {
     if (req) { this.upcoming = this.upcoming.filter(x => x !== req); await this.crossTo(req, 0, true); this.onRequest = true; return; }
     await this.crossTo(this.slot().id, this.slot().offset, false);
   }
-  play() { this.player?.playVideo(); }
-  pause() { this.player?.pauseVideo(); this.status = 'paused'; this.emit(); }
+  private userPaused = false;
+  play() { this.userPaused = false; this.player?.playVideo(); }
+  pause() { this.userPaused = true; this.player?.pauseVideo(); this.status = 'paused'; this.emit(); }
   stop() {
+    this.userPaused = true;
     this.decks.forEach(d => d.stopVideo());
     if (this.boundary) clearTimeout(this.boundary);
     if (this.preroll) clearTimeout(this.preroll);
