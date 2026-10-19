@@ -10,6 +10,7 @@ import type { Theme } from '@/lib/theme';
 import type {
   NowPlayingResponse, QueueEntry, RequestResult, SchedulePayload, SessionPayload, SessionTurn, StationState,
 } from '@/lib/types';
+import { onAir, type Song as NsSong } from './nsSchedule';
 import SONGS from './stationSongs.json';
 import blueprint from './themes/blueprint.json';
 import classicDark from './themes/classic-dark.json';
@@ -23,8 +24,21 @@ import vinyl from './themes/vinyl.json';
 export const STATION_NAME = 'nightshift radio';
 export const THEMES = [blueprint, classicDark, classicLight, cyberpunk, flare, recon, signal, vinyl] as Theme[];
 const TZ = 'Asia/Kolkata';
-const EPOCH = Date.UTC(2026, 0, 1);
-const SLOT_MS = 165_000; // 2:45 radio-edit slot per song on the shared clock
+
+// ---------- mood stations: each one is its own synced broadcast ----------
+export const MOODS: [id: string, label: string][] = [
+  ['trending', 'Trending'], ['romantic', 'Romantic'], ['sad', 'Heartbreak'], ['bhangra', 'Bhangra Party'],
+  ['gym', 'Gym Mode'], ['lofi', 'Lo-fi Chill'], ['retro', '90s Retro'], ['rap', 'Punjabi Rap'],
+  ['wedding', 'Shaadi Season'], ['sufi', 'Sufi Soul'], ['drive', 'Long Drive'], ['night', 'Late Night'],
+];
+const LIB = SONGS as { songs: Record<string, number>; moods: Record<string, string[]> };
+const MIXES: Record<string, string[]> = { night: ['lofi', 'romantic', 'sad', 'sufi'] };
+const moodList = (m: string): NsSong[] => {
+  const ids = MIXES[m] ? MIXES[m]!.flatMap(x => LIB.moods[x] ?? []) : LIB.moods[m] ?? [];
+  const list = [...new Set(ids)].filter(id => LIB.songs[id]).map(id => ({ id, d: LIB.songs[id]! }));
+  return list.length ? list : Object.entries(LIB.songs).map(([id, d]) => ({ id, d }));
+};
+export const moodLabel = (m: string) => MOODS.find(x => x[0] === m)?.[1] ?? 'Trending';
 
 // stationSongs.json: ~680 Punjabi hits harvested once from public YouTube playlists.
 
@@ -54,7 +68,7 @@ const LINES: Record<string, string[]> = {
 
 // ---------- saved taste ----------
 interface Song { title: string; likes: number; plays: number }
-interface Saved { songs: Record<string, Song>; banned: string[]; seeded?: boolean; volume?: number; seedIds?: string[] }
+interface Saved { songs: Record<string, Song>; banned: string[]; seeded?: boolean; volume?: number; seedIds?: string[]; mood?: string }
 const KEY = 'nightshift-radio';
 const load = (): Saved => { try { return { songs: {}, banned: [], ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch { return { songs: {}, banned: [] }; } };
 
@@ -111,6 +125,23 @@ class LocalStation {
     this.fetchWeather();
     this.say(`Station's warm. ${STATION_NAME}, ${currentShow().name} with ${personaOf().name}. Press play whenever you're ready.`, false);
     this.seeding = this.seed();
+    this.mood = this.saved.mood && MOODS.some(m => m[0] === this.saved.mood) ? this.saved.mood : 'trending';
+    this.syncClock();
+  }
+  mood = 'trending';
+  /** Device clock correction (ms) against the server, so drifting phones still hear the same moment. */
+  private skew = 0;
+  private now() { return Date.now() + this.skew; }
+  private syncClock() {
+    const t0 = Date.now();
+    fetch('/ns/time', { cache: 'no-store' }).then(r => r.json()).then((d: { now: number }) => {
+      const t1 = Date.now(); if (t1 - t0 < 3000) this.skew = d.now - (t0 + t1) / 2;
+    }).catch(() => {});
+  }
+  setMood(m: string) {
+    if (m === this.mood || !MOODS.some(x => x[0] === m)) return;
+    this.mood = m; this.saved.mood = m; this.save(); this.upcoming = []; this.emit();
+    if (this.status !== 'idle' && this.decks.length) { const sl = this.slot(); void this.crossTo(sl.id, sl.offset, false, `Switching to ${moodLabel(m)}.`); }
   }
   subscribe(fn: () => void) { this.subs.add(fn); return () => { this.subs.delete(fn); }; }
   private emit() { this.subs.forEach(f => f()); }
@@ -183,7 +214,7 @@ class LocalStation {
   private onEnded() {
     // Request finished: rejoin the broadcast. Song shorter than its slot: the DJ fills the gap.
     if (this.onRequest) { void this.crossTo(this.slot().id, this.slot().offset, true); return; }
-    if (this.slot().msLeft > 4000) void this.say(this.link(this.current, this.slot().next));
+    if (this.slot().msLeft > 4000) void this.djLine(this.current, this.slot().next).then(t => this.say(t));
   }
 
   private onPlaying() {
@@ -223,6 +254,19 @@ class LocalStation {
       u.onend = u.onerror = () => res(); speechSynthesis.cancel(); speechSynthesis.speak(u); setTimeout(res, 12000);
     });
   }
+  /** Gemini writes the link when the server has a key; otherwise the written lines below. */
+  private async djLine(prev: QueueEntry | null, nextId: string): Promise<string> {
+    const n = parseTitle(this.saved.songs[nextId]?.title), s = currentShow();
+    try {
+      const r = await fetch('/ns/dj', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(3500),
+        body: JSON.stringify({ host: personaOf(s).name, show: s.name, mood: moodLabel(this.mood),
+          time: new Date().toLocaleString('en-IN', { hour: 'numeric', minute: '2-digit', weekday: 'long', timeZone: TZ }),
+          weather: this.weather.temp != null ? `${this.weather.temp} degrees, ${this.weather.condition}` : '',
+          prev: prev?.title ? `${prev.title}${prev.artist ? ' by ' + prev.artist : ''}` : '', next: [n.title, n.artist].filter(Boolean).join(' by ') }) });
+      if (r.status === 200) { const d = await r.json() as { text?: string }; if (d.text) return d.text; }
+    } catch { /* offline or slow: fall through */ }
+    return this.link(prev, nextId);
+  }
   private link(prev: QueueEntry | null, nextId: string) {
     const s = currentShow(), lines = LINES[s.id] ?? [''], line = lines[Math.floor(Math.random() * lines.length)] ?? '';
     const when = new Date().toLocaleString('en-IN', { hour: 'numeric', minute: '2-digit', timeZone: TZ });
@@ -233,17 +277,10 @@ class LocalStation {
   }
 
   // ---------- shared clock: every listener hears the same song at the same moment ----------
-  private schedList(): string[] {
-    const ids = [...(SONGS as string[])]; // fixed, shipped list: identical on every device
-    let seed = Math.floor((Date.now() - EPOCH) / 86400000) + 1;
-    const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
-    for (let i = ids.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [ids[i], ids[j]] = [ids[j]!, ids[i]!]; }
-    return ids;
-  }
-  private slot(at = Date.now()) {
-    const list = this.schedList(), n = Math.floor((at - EPOCH) / SLOT_MS);
-    return { id: list.length ? list[n % list.length]! : 'kJQP7kiw5Fk', next: list.length ? list[(n + 1) % list.length]! : '',
-      offset: ((at - EPOCH) % SLOT_MS) / 1000, msLeft: SLOT_MS - ((at - EPOCH) % SLOT_MS) };
+  private slot() {
+    const salt = MOODS.findIndex(x => x[0] === this.mood) + 1;
+    const a = onAir(moodList(this.mood), this.now(), salt);
+    return a ?? { id: 'kJQP7kiw5Fk', next: 'kJQP7kiw5Fk', offset: 0, msLeft: 180000, nextD: 180, index: 0 };
   }
   private boundary: ReturnType<typeof setTimeout> | null = null;
   private preroll: ReturnType<typeof setTimeout> | null = null;
@@ -254,13 +291,14 @@ class LocalStation {
     this.init(); const resume = !!this.current && this.status === 'paused'; this.status = 'connecting'; this.emit();
     const p = await this.ensurePlayer(); if (!p) return;
     this.userPaused = false;
-    if (resume) { p.playVideo(); return; }
     await this.seeding;
-    // One tap and you're in: join the broadcast mid-song with a soft fade-in, no intro chatter.
+    // One tap and you're in: join the broadcast where it is right now, fading up. A resume after pause
+    // also rejoins live (it's radio), unless a request is mid-play.
+    if (resume && this.onRequest) { p.playVideo(); void this.ramp(this.live, 1, 600); return; }
     const sl = this.slot();
     this.setDeckVol(this.live, 0);
-    this.load(this.live, sl.id, sl.offset);
-    void this.ramp(this.live, 1, 2500);
+    this.load(this.live, sl.id, sl.offset + 0.4);
+    void this.ramp(this.live, 1, 1500);
     this.arm();
   }
   private load(deck: number, id: string, at: number) {
@@ -275,11 +313,11 @@ class LocalStation {
     this.preroll = setTimeout(() => {
       const idle = 1 - this.live; this.setDeckVol(idle, 0);
       (this.decks[idle] as unknown as { cueVideoById(o: { videoId: string; startSeconds: number }): void }).cueVideoById({ videoId: sl.next, startSeconds: 0 });
-    }, Math.max(0, sl.msLeft - 15000));
+    }, Math.max(0, sl.msLeft - 20000));
     this.boundary = setTimeout(() => void this.crossTo(this.slot().id, 0, true), sl.msLeft);
   }
   /** Crossfade from the live deck to `id` on the idle deck; the DJ talks over the blend. */
-  private async crossTo(id: string, at: number, talk: boolean) {
+  private async crossTo(id: string, at: number, talk: boolean, line?: string) {
     if (this.status === 'idle' || this.decks.length < 2) return;
     const prev = this.current, from = this.live, to = 1 - from;
     if (prev) { const h = this.history.find(x => x.subsonic_id === prev.id); if (h) h.endedAt = iso(); }
@@ -287,17 +325,18 @@ class LocalStation {
     this.setDeckVol(to, 0);
     this.live = to; this.load(to, id, at);
     this.showDeck(to);
-    const talking = talk ? this.say(this.link(prev, id)) : Promise.resolve();
-    await Promise.all([this.ramp(from, 0, 3000), this.ramp(to, talk ? 0.35 : 1, 2500)]);
+    const text = line ?? (talk ? await Promise.race([this.djLine(prev, id), new Promise<string>(r => setTimeout(() => r(this.link(prev, id)), 1800))]) : '');
+    const talking = text ? this.say(text) : Promise.resolve();
+    await Promise.all([this.ramp(from, 0, talk ? 2600 : 1200), this.ramp(to, text ? 0.4 : 1, talk ? 2200 : 1200)]);
     this.decks[from]?.stopVideo(); this.fading = false;
-    await talking; await this.ramp(to, 1, 1800);
+    await talking; await this.ramp(to, 1, 1200);
     this.arm();
   }
   /** Skip / request: a request crossfades in; otherwise rejoin the broadcast where it is now. */
   async next(_talk = false) {
     const req = this.upcoming.find(x => x !== this.slot().next);
     if (req) { this.upcoming = this.upcoming.filter(x => x !== req); await this.crossTo(req, 0, true); this.onRequest = true; return; }
-    await this.crossTo(this.slot().id, this.slot().offset, false);
+    const sl = this.slot(); await this.crossTo(sl.id, sl.offset, false);
   }
   private userPaused = false;
   // Keep the screen (and with it the tab) awake while the station is on air.
@@ -315,8 +354,8 @@ class LocalStation {
     this.bufTimer = setTimeout(() => { void this.say("Signal's a little weak right now. Hang tight, the music's coming back.", false); }, 4000);
   }
   private clearBuffering() { if (this.bufTimer) { clearTimeout(this.bufTimer); this.bufTimer = null; } }
-  play() { this.userPaused = false; this.player?.playVideo(); }
-  pause() { this.userPaused = true; this.player?.pauseVideo(); this.status = 'paused'; this.emit(); }
+  play() { void this.tune(); }
+  pause() { this.userPaused = true; this.status = 'paused'; this.emit(); const i = this.live; void this.ramp(i, 0, 350).then(() => { if (this.userPaused) this.decks[i]?.pauseVideo(); }); }
   stop() {
     this.userPaused = true;
     this.decks.forEach(d => d.stopVideo());
@@ -365,7 +404,7 @@ class LocalStation {
       } } });
     });
   }
-  private async seed() { (SONGS as string[]).forEach(id => (this.saved.songs[id] ??= { title: '', likes: 0, plays: 0 })); this.save(); }
+  private async seed() { Object.keys(LIB.songs).forEach(id => (this.saved.songs[id] ??= { title: '', likes: 0, plays: 0 })); this.save(); }
 
 
 
@@ -375,7 +414,7 @@ class LocalStation {
     const live = this.status === 'playing' || this.status === 'paused';
     return {
       nowPlaying: c && live ? { title: c.title || 'Tuning…', artist: c.artist || '', album: STATION_NAME, duration: c.duration, subsonic_id: c.id,
-        genre: 'Punjabi', moods: s.moods, energy: s.energy, bpm: null } : null,
+        genre: moodLabel(this.mood), moods: s.moods, energy: s.energy, bpm: null } : null,
       context: { time: { show: s.name, vibe: s.topic }, weather: this.weather, dominantMood: s.mood, activeShow: { name: s.name, persona: { id: p.id, name: p.name, avatar: '' }, guests: [] } },
       dj: { station: STATION_NAME, stationDescription: 'your late-night companion, a DJ who never clocks out.', tagline: p.tagline, name: p.name },
       activeShow: { name: s.name, persona: { id: p.id, name: p.name, avatar: '' }, guests: [] },
