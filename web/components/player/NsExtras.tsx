@@ -5,9 +5,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { station } from '@/lib/localStation';
+import { addFiles, clearTracks } from '@/lib/offlineLib';
 
-type Tab = 'search' | 'lyrics' | 'dedicate' | 'timer' | 'history' | 'wrapped' | null;
-const TABS: [Exclude<Tab, null>, string][] = [['search', 'Search'], ['lyrics', 'Lyrics'], ['dedicate', 'Dedicate'], ['timer', 'Sleep'], ['history', '24h'], ['wrapped', 'Wrapped']];
+type Tab = 'offline' | 'search' | 'lyrics' | 'dedicate' | 'timer' | 'history' | 'wrapped' | null;
+const TABS: [Exclude<Tab, null>, string][] = [['search', 'Search'], ['lyrics', 'Lyrics'], ['dedicate', 'Dedicate'], ['timer', 'Sleep'], ['history', '24h'], ['wrapped', 'Wrapped'], ['offline', 'Offline']];
 const btn = 'rounded-md border border-line px-1.5 py-0.5 hover:border-ink';
 
 function Search() {
@@ -35,6 +36,24 @@ function Search() {
         ))}
       </ul>
       <p className="text-muted">Tap to play now. It also joins My Station.</p>
+    </div>
+  );
+}
+
+function Offline() {
+  const [busy, setBusy] = useState(false);
+  const add = async (files: FileList | null) => { if (!files?.length) return; setBusy(true); await addFiles(files); await station.reloadTracks(); setBusy(false); };
+  return (
+    <div className="flex flex-col gap-2">
+      <p>Play your own songs with no internet. Files stay on this device.</p>
+      <p className="text-ink">{station.trackCount} songs saved{busy ? ' · adding…' : ''}</p>
+      <label className={`${btn} cursor-pointer text-center`}>
+        + Add songs (MP3, M4A…)
+        <input type="file" accept="audio/*" multiple className="hidden" onChange={e => void add(e.target.files)} />
+      </label>
+      <button className={btn} disabled={!station.trackCount} onClick={() => { station.setMood('local'); void station.tune(); }}>▶ Play offline</button>
+      {station.trackCount > 0 && <button className={btn} onClick={() => void clearTracks().then(() => station.reloadTracks())}>Remove all</button>}
+      <p className="text-muted">If the network drops, the station switches here by itself.</p>
     </div>
   );
 }
@@ -149,7 +168,7 @@ export default function NsExtras() {
     <div ref={root} className="relative z-30 mt-1.5 font-mono text-[10px] tracking-[1px] text-muted">
       {tab && (
         <div className="absolute right-0 bottom-full z-30 mb-2 w-72 rounded-xl border border-line bg-bg p-3 text-[11px] normal-case shadow-xl">
-          {tab === 'search' && <Search />}{tab === 'lyrics' && <Lyrics />}{tab === 'dedicate' && <Dedicate />}{tab === 'timer' && <Timer />}
+          {tab === 'offline' && <Offline />}{tab === 'search' && <Search />}{tab === 'lyrics' && <Lyrics />}{tab === 'dedicate' && <Dedicate />}{tab === 'timer' && <Timer />}
           {tab === 'history' && <History />}{tab === 'wrapped' && <Wrapped />}
         </div>
       )}

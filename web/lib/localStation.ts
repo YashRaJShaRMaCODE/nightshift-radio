@@ -12,6 +12,7 @@ import type {
 } from '@/lib/types';
 import { TAIL, onAir, type Song as NsSong } from './nsSchedule';
 import SONGS from './stationSongs.json';
+import { listTracks, type LocalTrack } from './offlineLib';
 import blueprint from './themes/blueprint.json';
 import classicDark from './themes/classic-dark.json';
 import classicLight from './themes/classic-light.json';
@@ -27,7 +28,7 @@ const TZ = 'Asia/Kolkata';
 
 // ---------- mood stations: each one is its own synced broadcast ----------
 export const MOODS: [id: string, label: string][] = [
-  ['mine', 'My Station'], ['trending', 'Trending'], ['romantic', 'Romantic'], ['sad', 'Heartbreak'], ['bhangra', 'Bhangra Party'],
+  ['mine', 'My Station'], ['local', 'Offline · My Files'], ['trending', 'Trending'], ['romantic', 'Romantic'], ['sad', 'Heartbreak'], ['bhangra', 'Bhangra Party'],
   ['gym', 'Gym Mode'], ['lofi', 'Lo-fi Chill'], ['retro', '90s Retro'], ['rap', 'Punjabi Rap'],
   ['wedding', 'Shaadi Season'], ['sufi', 'Sufi Soul'], ['drive', 'Long Drive'], ['night', 'Late Night'],
   ['haryanvi', 'Haryanvi'], ['english', 'English Hits'], ['bollywood', 'Bollywood'], ['oldhindi', 'Old Hindi'],
@@ -40,7 +41,7 @@ const moodList = (m: string): NsSong[] => {
   return list.length ? list : Object.entries(LIB.songs).map(([id, d]) => ({ id, d }));
 };
 const MOOD_THEME: Record<string, string> = { sad: 'blueprint', bhangra: 'flare', sufi: 'vinyl', lofi: 'classic-dark', night: 'cyberpunk',
-  romantic: 'classic-light', retro: 'recon', rap: 'signal', gym: 'flare', wedding: 'vinyl', drive: 'cyberpunk', trending: 'classic-dark', mine: 'classic-dark',
+  romantic: 'classic-light', retro: 'recon', rap: 'signal', gym: 'flare', wedding: 'vinyl', drive: 'cyberpunk', trending: 'classic-dark', mine: 'classic-dark', local: 'vinyl',
   haryanvi: 'flare', english: 'classic-light', bollywood: 'recon', oldhindi: 'vinyl' };
 export const moodLabel = (m: string) => MOODS.find(x => x[0] === m)?.[1] ?? 'Trending';
 
@@ -139,6 +140,8 @@ class LocalStation {
     this.seeding = this.seed();
     this.mood = this.saved.mood && MOODS.some(m => m[0] === this.saved.mood) ? this.saved.mood : 'trending';
     this.syncClock();
+    void this.reloadTracks();
+    window.addEventListener('offline', () => { if (this.mood !== 'local' && this.tracks.length) { this.setMood('local'); void this.say('Network dropped. Switching to your own files.', false); } });
   }
   mood = 'trending';
   /** Device clock correction (ms) against the server, so drifting phones still hear the same moment. */
@@ -153,6 +156,8 @@ class LocalStation {
   setMood(m: string) {
     if (m === this.mood || !MOODS.some(x => x[0] === m)) return;
     this.mood = m; this.saved.mood = m; this.save(); this.upcoming = []; this.emit();
+    if (m === 'local') { if (this.status !== 'idle') { this.decks.forEach(d => d.stopVideo()); if (this.boundary) clearTimeout(this.boundary); if (this.preroll) clearTimeout(this.preroll); void this.localNext(false); } return; }
+    if (this.localCur) { this.stopLocal(); if (this.status !== 'idle') { this.status = 'connecting'; void this.tune(); } return; }
     if (this.status !== 'idle' && this.decks.length) {
       const sl = this.slot(), at = m === 'mine' ? 0 : sl.offset;
       const hint = m === 'mine' && !this.minePool().length ? ' Paste your own playlist link in Request, or tap Keep on songs you love, and this becomes yours.' : '';
@@ -351,7 +356,59 @@ class LocalStation {
   private onRequest = false;
   private fading = false;
 
+  // ---------- Offline · My Files: the listener's own audio files, no network, two <audio> decks ----------
+  private aud: HTMLAudioElement[] = [];
+  private audLive = 0;
+  private tracks: LocalTrack[] = [];
+  private localUrl: string[] = ['', ''];
+  private localT: ReturnType<typeof setTimeout> | null = null;
+  private localCur: LocalTrack | null = null;
+  async reloadTracks() { this.tracks = await listTracks(); this.emit(); return this.tracks.length; }
+  get trackCount() { return this.tracks.length; }
+  private ensureAudio() {
+    if (this.aud.length) return;
+    for (let i = 0; i < 2; i++) { const a = new Audio(); a.preload = 'auto'; a.onended = () => { if (i === this.audLive && this.mood === 'local') void this.localNext(true); }; this.aud.push(a); }
+  }
+  private pickLocal(): LocalTrack | null {
+    if (!this.tracks.length) return null;
+    const recent = new Set(this.history.slice(0, Math.min(10, this.tracks.length - 1)).map(h => h.subsonic_id));
+    const pool = this.tracks.filter(t => !recent.has(t.id));
+    const list = pool.length ? pool : this.tracks;
+    return list[Math.floor(Math.random() * list.length)]!;
+  }
+  private rampAudio(a: HTMLAudioElement, to: number, ms: number): Promise<void> {
+    const from = a.volume, steps = Math.max(1, Math.round(ms / 60));
+    return new Promise(res => { let k = 0; const t = setInterval(() => { k++; a.volume = Math.max(0, Math.min(1, (from + (to - from) * (k / steps)) * 1)); if (k >= steps) { clearInterval(t); res(); } }, 60); });
+  }
+  private async localNext(talk: boolean) {
+    this.ensureAudio(); if (!this.tracks.length) await this.reloadTracks();
+    const t = this.pickLocal();
+    if (!t) { this.status = 'idle'; this.emit(); void this.say('No songs on this device yet. Add your own files under Offline, then press play.', false); return; }
+    const prev = this.current, from = this.audLive, to = this.aud[from]?.src ? 1 - from : from;
+    const a = this.aud[to]!;
+    if (this.localUrl[to]) URL.revokeObjectURL(this.localUrl[to]!);
+    this.localUrl[to] = URL.createObjectURL(t.blob); a.src = this.localUrl[to]!; a.volume = 0;
+    const { title, artist } = parseTitle(t.name);
+    this.saved.songs[t.id] ??= { title: t.name, likes: 0, plays: 0 };
+    this.localCur = t; this.audLive = to;
+    this.current = { id: t.id, subsonic_id: t.id, title, artist, startedAt: iso() };
+    this.history.unshift({ title, artist, subsonic_id: t.id, startedAt: this.current.startedAt }); this.history = this.history.slice(0, 30);
+    this.status = 'playing'; this.emit();
+    try { await a.play(); } catch { /* autoplay blocked until a tap */ }
+    const talking = talk ? this.say(this.link(prev, t.id)) : Promise.resolve();
+    const old = from !== to ? this.aud[from] : undefined;
+    await Promise.all([old ? this.rampAudio(old, 0, 2500) : Promise.resolve(), this.rampAudio(a, talk ? 0.4 * this.volume : this.volume, 2000)]);
+    old?.pause(); await talking; await this.rampAudio(a, this.volume, 1200);
+    if (this.localT) clearTimeout(this.localT);
+    const armAt = () => { if (this.current?.id === t.id) { this.current = { ...this.current, duration: a.duration }; this.emit(); } const left = (a.duration - a.currentTime - TAIL) * 1000; if (Number.isFinite(left)) this.localT = setTimeout(() => { if (this.mood === 'local' && this.localCur === t) void this.localNext(true); }, Math.max(1000, left)); };
+    if (Number.isFinite(a.duration)) armAt(); else a.onloadedmetadata = armAt;
+  }
+  private stopLocal() { if (this.localT) clearTimeout(this.localT); this.aud.forEach(a => a.pause()); this.localCur = null; }
+
   async tune() {
+    if (this.mood === 'local') { this.init(); this.userPaused = false; const a = this.aud[this.audLive];
+      if (this.status === 'paused' && a?.src) { await a.play().catch(() => {}); this.status = 'playing'; void this.rampAudio(a, this.volume, 500); this.emit(); return; }
+      await this.localNext(false); return; }
     this.init(); const resume = !!this.current && this.status === 'paused'; this.status = 'connecting'; this.emit();
     const p = await this.ensurePlayer(); if (!p) return;
     this.userPaused = false;
@@ -400,6 +457,7 @@ class LocalStation {
   }
   /** Skip / request: a request crossfades in; otherwise rejoin the broadcast where it is now. */
   async next(_talk = false) {
+    if (this.mood === 'local') { await this.localNext(false); return; }
     const req = this.upcoming.find(x => x !== this.slot().next);
     if (req) { this.upcoming = this.upcoming.filter(x => x !== req); await this.crossTo(req, 0, true); this.onRequest = true; return; }
     if (this.mood === 'mine') { await this.crossTo(this.pickMine(), 0, false); return; }
@@ -503,8 +561,10 @@ class LocalStation {
   }
 
   play() { void this.tune(); }
-  pause() { this.userPaused = true; this.status = 'paused'; this.emit(); const i = this.live; void this.ramp(i, 0, 350).then(() => { if (this.userPaused) this.decks[i]?.pauseVideo(); }); }
+  pause() { if (this.mood === 'local') { this.userPaused = true; this.status = 'paused'; this.emit(); const a = this.aud[this.audLive]; if (a) void this.rampAudio(a, 0, 300).then(() => a.pause()); return; }
+    this.userPaused = true; this.status = 'paused'; this.emit(); const i = this.live; void this.ramp(i, 0, 350).then(() => { if (this.userPaused) this.decks[i]?.pauseVideo(); }); }
   stop() {
+    this.stopLocal();
     this.userPaused = true;
     this.decks.forEach(d => d.stopVideo());
     if (this.boundary) clearTimeout(this.boundary);
@@ -513,8 +573,8 @@ class LocalStation {
     this.wake?.release().catch(() => {}); this.wake = null; this.clearBuffering();
     this.status = 'idle'; this.current = null; this.emit();
   }
-  setVolume(v: number) { this.volume = Math.max(0, Math.min(1, v)); this.decks.forEach((_, i) => this.setDeckVol(i, this.deckVol[i] ?? 1)); this.save(); this.emit(); }
-  elapsed() { const p = this.player; return p && typeof p.getCurrentTime === 'function' ? p.getCurrentTime() || 0 : 0; }
+  setVolume(v: number) { this.volume = Math.max(0, Math.min(1, v)); const la = this.aud[this.audLive]; if (this.localCur && la) la.volume = this.volume; this.decks.forEach((_, i) => this.setDeckVol(i, this.deckVol[i] ?? 1)); this.save(); this.emit(); }
+  elapsed() { if (this.localCur) return this.aud[this.audLive]?.currentTime ?? 0; const p = this.player; return p && typeof p.getCurrentTime === 'function' ? p.getCurrentTime() || 0 : 0; }
 
   like(songId: string) {
     const s = this.saved.songs[songId]; if (!s) return { ok: false, error: 'no track' };
