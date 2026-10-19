@@ -1,0 +1,1544 @@
+'use client';
+
+import { LLM_PROVIDER_FORM_KEYS } from './registry';
+
+import type { ChangeEvent } from 'react';
+import { useEffect, useState } from 'react';
+import { notify, errorMessage } from '../../../lib/notify';
+import { adminResponse } from '../../../lib/admin-query';
+import { fieldAria } from '../../../lib/form';
+import { useModelDiscovery } from '@/hooks/useModelDiscovery';
+import { V3AlertDialog } from '../../ui/alert-dialog';
+import { Input } from '../../ui/input';
+import { Label } from '../../ui/label';
+import {
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup,
+} from '../../ui/select';
+import { Card, Btn, Pill, Seg } from '../ui';
+import { ProviderSelector } from '../llm/ProviderSelector';
+import { ModelCombobox } from '../llm/ModelCombobox';
+import { LLM_ENV_VARS, llmProviderLabel } from '../llm/providerMeta';
+import { Advanced } from './section-chrome';
+import { COMPAT_MODE_OPTIONS, compatDetectedNote, effectiveCompatMode, type CompatMode } from './compat-mode';
+import { pinnedFieldNames, type SwapEmbeddingPreview } from './llm-swap-copy';
+import {
+  SectionHeader, SaveBar, KeyStatus, KeyTestResult, KEY_HINTS, NowBanner,
+  headerMap,
+  type SectionProps, type LlmHeaderRow,
+} from './shared';
+import {
+  LLM_HEADER_NAME_RE,
+  LLM_HEADER_VALUE_RE,
+  LLM_HEADER_VALUE_MAX,
+  LLM_HEADERS_MAX,
+  type GeminiSafety,
+} from '@/lib/schemas.generated';
+
+// Provider descriptors, the cloud-key env-var map and the badge logic live in
+// ./llm/providerMeta — don't redefine them here.
+
+// Bearer typed inline (into settings.llm.keys per provider, not secrets.env), URL
+// in providerBaseUrls. locca's URL may be blank: the controller falls back to
+// DEFAULT_LOCCA_BASE_URL (registry.ts), mirrored here so Test connection works
+// without an explicit override.
+const INLINE_KEY_PROVIDERS = ['openai-compatible', 'locca'];
+const LOCCA_DEFAULT_BASE_URL = 'http://host.docker.internal:8080/v1';
+
+const GEMINI_SAFETY_LABELS: { id: keyof GeminiSafety; label: string }[] = [
+  { id: 'harassment', label: 'Harassment' },
+  { id: 'hateSpeech', label: 'Hate speech' },
+  { id: 'sexuallyExplicit', label: 'Sexually explicit' },
+  { id: 'dangerousContent', label: 'Dangerous content' },
+];
+
+function GeminiSafetyEditor({ value, onChange, idPrefix }: {
+  value: GeminiSafety;
+  onChange: (category: keyof GeminiSafety, checked: boolean) => void;
+  idPrefix: string;
+}) {
+  const aria = fieldAria(idPrefix, undefined, { hasDescription: true });
+  return (
+    <div className="field">
+      <div {...aria.labelledByProps} className="text-[13px] font-bold">Block categories</div>
+      <div role="group" {...aria.groupProps} className="mt-2 flex flex-col gap-2">
+        {GEMINI_SAFETY_LABELS.map(({ id, label }) => (
+          <label key={id} className="flex cursor-pointer items-center gap-2 text-[13px] leading-[1.5] text-ink">
+            <input
+              type="checkbox"
+              checked={value[id]}
+              onChange={e => onChange(id, e.target.checked)}
+              className="accent-[var(--accent)]"
+            />
+            <span>{label}</span>
+          </label>
+        ))}
+      </div>
+      <div {...aria.descriptionProps} className="field-hint mt-2">
+        Checked categories block content with medium or high probability of harm.
+        Unchecked categories allow it. Primary and fallback settings are independent
+        and apply only when that model uses Google.
+      </div>
+    </div>
+  );
+}
+
+// Custom request headers for an openai-compatible gateway (#1618). A row list
+// rather than a map: the operator types a name one character at a time, and a
+// map keyed by that name loses the row on every blank or duplicate key.
+//
+// Values already on file arrive redacted as the literal 'set' (getRedacted),
+// and posting that back keeps the stored value — so an untouched row shows as
+// "on file" and is left alone rather than being re-typed to survive a save.
+export function HeaderRowsEditor({
+  rows, onChange, disabled, idPrefix,
+}: {
+  rows: LlmHeaderRow[];
+  onChange: (next: LlmHeaderRow[]) => void;
+  disabled?: boolean;
+  idPrefix: string;
+}) {
+  const setRow = (i: number, patch: Partial<LlmHeaderRow>) =>
+    onChange(rows.map((r, n) => (n === i ? { ...r, ...patch } : r)));
+
+  const problem = (r: LlmHeaderRow): string => {
+    const name = (r.name || '').trim();
+    const value = (r.value || '').trim();
+    if (!name && !value) return '';
+    if (!name) return 'Name a header';
+    if (!LLM_HEADER_NAME_RE.test(name)) return 'Letters, digits and - . _ only, up to 64 chars';
+    if (value === 'set') return ''; // the redaction sentinel — the real value is on file
+    if (value.length > LLM_HEADER_VALUE_MAX) return `Value must be ${LLM_HEADER_VALUE_MAX} chars or fewer`;
+    if (value && !LLM_HEADER_VALUE_RE.test(value)) return 'Value must be printable ASCII on a single line';
+    return '';
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      {rows.map((r, i) => {
+        const err = problem(r);
+        return (
+          <div key={`${idPrefix}-${i}`} className="flex flex-col gap-1">
+            <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
+              <Input
+                value={r.name}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => setRow(i, { name: e.target.value })}
+                placeholder="x-my-gateway-session"
+                disabled={disabled}
+                aria-label="Header name"
+                className="max-w-[220px]"
+              />
+              <Input
+                value={r.value}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => setRow(i, { value: e.target.value })}
+                placeholder={r.value === 'set' ? '•••••• (on file)' : 'value'}
+                disabled={disabled}
+                aria-label="Header value"
+                className="max-w-[260px]"
+              />
+              <Btn onClick={() => onChange(rows.filter((_, n) => n !== i))} disabled={disabled}>
+                Remove
+              </Btn>
+            </div>
+            {err && <div className="text-xs text-vermilion">{err}</div>}
+          </div>
+        );
+      })}
+      <div>
+        <Btn
+          onClick={() => onChange([...rows, { name: '', value: '' }])}
+          disabled={disabled || rows.length >= LLM_HEADERS_MAX}
+        >
+          Add header
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+interface LlmSectionProps extends SectionProps {
+  adminFetch: (path: string, init?: RequestInit) => Promise<Response>;
+  refresh: () => void;
+  /** Settings holds unsaved edits in ANY section, not just this one. The swap
+   *  saves straight away from the stored settings, and while anything is
+   *  unsaved the panel holds the post-swap read back from the form. */
+  unsavedChanges?: boolean;
+  /** POST /settings/llm/swap through the panel, which adopts the swapped legs
+   *  from the authoritative read (SettingsPanel swapLlmLegs). */
+  swapLegs: () => Promise<boolean>;
+}
+export function LlmSection({ data, form, setForm, busy, saveSettings, adminFetch, refresh, fieldErrors, unsavedChanges = false, swapLegs }: LlmSectionProps) {
+  const [swapOpen, setSwapOpen] = useState(false);
+  const [swapping, setSwapping] = useState(false);
+  // What the backup may not suit once primary, for the agentic routes set in
+  // Music selection / DJ behaviour (settings/llm-swap-fit.ts). Warning only:
+  // null while loading, 'error' when the check could not run.
+  const [swapFit, setSwapFit] = useState<SwapFit | 'error' | null>(null);
+  const openSwap = async () => {
+    setSwapFit(null);
+    setSwapOpen(true);
+    try {
+      // admin-query-imperative: llm-swap-fit-preview
+      const r = await adminResponse(adminFetch, '/settings/llm/swap/fit');
+      setSwapFit(await r.json() as SwapFit);
+    } catch {
+      setSwapFit('error');
+    }
+  };
+  // The swap is built and saved on the controller (settings/llm-swap.ts):
+  // headers only ever reach this page redacted, so the browser cannot move them.
+  const confirmSwap = async () => {
+    setSwapping(true);
+    try {
+      await swapLegs();
+    } finally {
+      setSwapping(false);
+      setSwapOpen(false);
+    }
+  };
+  const [resetCompatKey, setResetCompatKey] = useState(false);
+  const [primaryKeyInput, setPrimaryKeyInput] = useState('');
+  const [fallbackKeyInput, setFallbackKeyInput] = useState('');
+  const [primaryKeyTest, setPrimaryKeyTest] = useState<{ ok: boolean; message: string; latencyMs: number } | null>(null);
+  const [primaryKeyTesting, setPrimaryKeyTesting] = useState(false);
+  const [fallbackKeyTest, setFallbackKeyTest] = useState<{ ok: boolean; message: string; latencyMs: number } | null>(null);
+  const [fallbackKeyTesting, setFallbackKeyTesting] = useState(false);
+
+  useEffect(() => { setPrimaryKeyInput(''); }, [form.llm.provider]);
+  useEffect(() => { setFallbackKeyInput(''); }, [form.llm.fallback.provider]);
+  useEffect(() => { setPrimaryKeyTest(null); }, [form.llm.provider]);
+  useEffect(() => { setFallbackKeyTest(null); }, [form.llm.fallback.provider]);
+
+  const [compatKeyInput, setCompatKeyInput] = useState('');
+  const [compatFallbackKeyInput, setCompatFallbackKeyInput] = useState('');
+  const [compatKeyTest, setCompatKeyTest] = useState<{ ok: boolean; message: string; latencyMs: number } | null>(null);
+  const [compatFallbackKeyTest, setCompatFallbackKeyTest] = useState<{ ok: boolean; message: string; latencyMs: number } | null>(null);
+  const [compatKeyTesting, setCompatKeyTesting] = useState(false);
+  const [compatFallbackKeyTesting, setCompatFallbackKeyTesting] = useState(false);
+  useEffect(() => { setCompatKeyInput(''); setCompatKeyTest(null); }, [form.llm.provider]);
+  useEffect(() => { setCompatFallbackKeyInput(''); setCompatFallbackKeyTest(null); }, [form.llm.fallback.provider]);
+
+  // Embeddings inherit settings.llm when embedding.provider === '', so switching the
+  // CHAT provider would silently change the EMBEDDING model, invalidating an
+  // already-embedded library and breaking vector search until a re-embed. Pin them
+  // to the index's actual model instead and surface a notice.
+  const [embedPinNotice, setEmbedPinNotice] = useState<{ model: string; dim: number; newProvider: string } | null>(null);
+  const changeLlmProvider = (v: string) => {
+    if (v === form.llm.provider) return;
+    const inheriting = (form.embedding.provider ?? '') === '';
+    const meta = data.libraryStats?.embeddingMeta;
+    const pin = inheriting && !!meta?.model;
+    setForm(f => {
+      if (!f) return f;
+      const next = { ...f, llm: { ...f.llm, provider: v } };
+      if (pin && meta) {
+        // Stored as "provider:model"; split on the FIRST colon so ollama tags with
+        // their own colon (bge-m3:latest) keep the tag intact.
+        const i = meta.model.indexOf(':');
+        const pinProvider = i > 0 ? meta.model.slice(0, i) : '';
+        const pinModel = i > 0 ? meta.model.slice(i + 1) : meta.model;
+        if (pinProvider) next.embedding = { ...f.embedding, provider: pinProvider, model: pinModel };
+      }
+      return next;
+    });
+    if (pin && meta) setEmbedPinNotice({ model: meta.model, dim: meta.dim, newProvider: v });
+  };
+
+  const primaryKeyVar = LLM_ENV_VARS[form.llm.provider];
+  const primaryKeySet = !!(primaryKeyVar && data.env?.[primaryKeyVar]);
+
+  const primaryBaseUrl = form.llm.providerBaseUrls[form.llm.provider] ?? '';
+  const primaryTestBaseUrl =
+    primaryBaseUrl || (form.llm.provider === 'locca' ? LOCCA_DEFAULT_BASE_URL : '');
+
+  const primaryDiscoveryEnabled =
+    form.llm.provider === 'ollama'
+    || form.llm.provider === 'locca'
+    || (form.llm.provider === 'openai-compatible' && !!primaryBaseUrl.trim())
+    || (form.llm.provider === 'openrouter')
+    || (!!primaryKeyVar && primaryKeySet);
+
+  const primaryDiscovery = useModelDiscovery({
+    provider: form.llm.provider,
+    baseUrl: primaryBaseUrl,
+    ollamaUrl: form.llm.ollamaUrl,
+    enabled: primaryDiscoveryEnabled,
+    adminFetch,
+  });
+
+  const fallbackKeyVar = LLM_ENV_VARS[form.llm.fallback.provider];
+  const fallbackKeySet = !!(fallbackKeyVar && data.env?.[fallbackKeyVar]);
+
+  const fallbackBaseUrl = form.llm.fallback.providerBaseUrls[form.llm.fallback.provider] ?? '';
+  const fallbackTestBaseUrl =
+    fallbackBaseUrl || (form.llm.fallback.provider === 'locca' ? LOCCA_DEFAULT_BASE_URL : '');
+
+  const fallbackDiscoveryEnabled =
+    form.llm.fallback.enabled && (
+      form.llm.fallback.provider === 'ollama'
+      || form.llm.fallback.provider === 'locca'
+      || (form.llm.fallback.provider === 'openai-compatible' && !!fallbackBaseUrl.trim())
+      || (form.llm.fallback.provider === 'openrouter')
+      || (!!fallbackKeyVar && fallbackKeySet)
+    );
+
+  const fallbackDiscovery = useModelDiscovery({
+    provider: form.llm.fallback.provider,
+    baseUrl: fallbackBaseUrl,
+    ollamaUrl: form.llm.fallback.ollamaUrl,
+    enabled: fallbackDiscoveryEnabled,
+    adminFetch,
+  });
+
+  const saveKey = async (envVar: string, value: string): Promise<boolean> => {
+    if (!value.trim()) return true;
+    try {
+      const r = await adminResponse(adminFetch, '/settings/secrets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [envVar]: value.trim() }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({})) as { error?: string };
+        notify.err(j.error || `Key save failed (${r.status})`);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      notify.err(errorMessage(e));
+      return false;
+    }
+  };
+
+  const testKey = async (
+    envVar: string,
+    value: string,
+    setTesting: (v: boolean) => void,
+    setResult: (r: { ok: boolean; message: string; latencyMs: number } | null) => void,
+    clearInput?: () => void,
+  ) => {
+    const hasTyped = !!value.trim();
+    if (!hasTyped && !data.env?.[envVar]) return;
+    setTesting(true);
+    setResult(null);
+    try {
+      const r = await adminResponse(adminFetch, '/settings/secrets/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: envVar, value: value.trim() }),
+      });
+      const j = await r.json() as { ok: boolean; message: string; latencyMs: number };
+      setResult(j);
+      if (j.ok && hasTyped) {
+        const saved = await saveKey(envVar, value);
+        if (saved) { notify.ok('Key verified and saved'); clearInput?.(); refresh(); }
+      } else if (j.ok) {
+        notify.ok('Key verified (on file)');
+      }
+    } catch (e) {
+      setResult({ ok: false, message: errorMessage(e), latencyMs: 0 });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const testCompatKey = async (
+    apiKey: string,
+    baseUrl: string,
+    model: string,
+    setTesting: (v: boolean) => void,
+    setResult: (r: { ok: boolean; message: string; latencyMs: number } | null) => void,
+    // The leg's custom headers as currently edited. A gateway that routes on a
+    // header rejects a probe without it, so a test that omitted them would fail
+    // against exactly the server being configured (#1618). Unsaved rows are
+    // tested as typed; a row still showing the redaction sentinel resolves
+    // server-side against the stored value.
+    customHeaders: LlmHeaderRow[] = [],
+  ) => {
+    if (!baseUrl.trim()) { setResult({ ok: false, message: 'Set a Base URL first', latencyMs: 0 }); return; }
+    if (!model.trim()) { setResult({ ok: false, message: 'Set a Model first', latencyMs: 0 }); return; }
+    setTesting(true);
+    setResult(null);
+    try {
+      const r = await adminResponse(adminFetch, '/settings/llm/probe-compat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey: apiKey.trim(),
+          baseUrl: baseUrl.trim(),
+          model: model.trim(),
+          headers: headerMap(customHeaders),
+        }),
+      });
+      const j = await r.json() as { ok: boolean; message: string; latencyMs: number };
+      setResult(j);
+    } catch (e) {
+      setResult({ ok: false, message: errorMessage(e), latencyMs: 0 });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const save = async () => {
+    const activeProvider = form.llm.provider;
+    const activeFallbackProvider = form.llm.fallback.provider;
+    await saveSettings({
+      llm: {
+        provider: activeProvider,
+        model: form.llm.model,
+        ollamaUrl: form.llm.ollamaUrl,
+        numCtx: form.llm.numCtx,
+        repeatPenalty: form.llm.repeatPenalty,
+        providerBaseUrls: form.llm.providerBaseUrls,
+        headers: headerMap(form.llm.headers),
+        compatibleMode: form.llm.compatibleMode,
+        reasoning: form.llm.reasoning,
+        toolChoice: form.llm.toolChoice,
+        pauseWhenEmpty: form.llm.pauseWhenEmpty,
+        dailyTokenCap: form.llm.dailyTokenCap,
+        budgetSoftPct: form.llm.budgetSoftPct,
+        exemptRequests: form.llm.exemptRequests,
+        maxOutputTokens: form.llm.maxOutputTokens,
+        geminiSafety: { ...form.llm.geminiSafety },
+        ...(INLINE_KEY_PROVIDERS.includes(activeProvider) && (compatKeyInput.trim() || resetCompatKey)
+          ? { apiKey: compatKeyInput.trim() }
+          : {}),
+        fallback: {
+          enabled: form.llm.fallback.enabled,
+          provider: activeFallbackProvider,
+          model: form.llm.fallback.model,
+          ollamaUrl: form.llm.fallback.ollamaUrl,
+          numCtx: form.llm.fallback.numCtx,
+          repeatPenalty: form.llm.fallback.repeatPenalty,
+          discoverySteps: form.llm.fallback.discoverySteps,
+          geminiSafety: { ...form.llm.fallback.geminiSafety },
+          providerBaseUrls: form.llm.fallback.providerBaseUrls,
+          headers: headerMap(form.llm.fallback.headers),
+          compatibleMode: form.llm.fallback.compatibleMode,
+          reasoning: form.llm.fallback.reasoning,
+          toolChoice: form.llm.fallback.toolChoice,
+          ...(INLINE_KEY_PROVIDERS.includes(activeFallbackProvider) && compatFallbackKeyInput.trim()
+            ? { apiKey: compatFallbackKeyInput.trim() }
+            : {}),
+        },
+      },
+    });
+    // Save API keys if typed — these go to secrets.env, not settings.json
+    const primaryKeyVar = LLM_ENV_VARS[activeProvider];
+    if (primaryKeyVar && primaryKeyInput.trim()) {
+      const ok = await saveKey(primaryKeyVar, primaryKeyInput);
+      if (ok) { notify.ok('API key saved'); setPrimaryKeyInput(''); refresh(); }
+    }
+    const fallbackKeyVar = LLM_ENV_VARS[activeFallbackProvider];
+    if (fallbackKeyVar && fallbackKeyInput.trim()) {
+      const ok = await saveKey(fallbackKeyVar, fallbackKeyInput);
+      if (ok) { notify.ok('API key saved'); setFallbackKeyInput(''); refresh(); }
+    }
+    if (INLINE_KEY_PROVIDERS.includes(activeProvider) && compatKeyInput.trim()) {
+      setCompatKeyInput('');
+    }
+    setResetCompatKey(false);
+    if (INLINE_KEY_PROVIDERS.includes(activeFallbackProvider) && compatFallbackKeyInput.trim()) {
+      setCompatFallbackKeyInput('');
+    }
+  };
+
+  const savedLlm = data.values?.llm || {};
+  const activeLabel = data.llm?.active || '';
+  const activeColon = activeLabel.indexOf(':');
+  const activeProvider = activeColon > -1 ? activeLabel.slice(0, activeColon) : (savedLlm.provider || '');
+  const activeModel = activeColon > -1 ? activeLabel.slice(activeColon + 1) : '';
+  const llmDirty = form.llm.provider !== savedLlm.provider
+    || (form.llm.model || '').trim() !== (savedLlm.model || '').trim();
+
+  return (
+    <>
+      <SectionHeader
+        eyebrow="llm provider"
+        title="The model that writes scripts and picks tracks."
+        sub="Ollama runs on the homelab box and needs no key; the cloud providers are opt-in. Switching here reroutes every LLM call, no redeploy."
+        metrics={[{ n: String((data.llm?.providers || []).length), l: 'providers' }]}
+        manualHref="/manual/llm"
+      />
+
+      <Card title="Provider" sub="active routing">
+        <div className="grid gap-[18px]">
+          <NowBanner label={<>Routing now · {llmProviderLabel(activeProvider)}</>}>
+            {activeModel
+              ? <>Model <code>{activeModel}</code>, every LLM call goes here. {llmDirty ? 'Your edits below aren’t live until you Save.' : 'This is the saved, running config.'}</>
+              : <>No model is set for this provider yet.</>}
+          </NowBanner>
+
+          <div className="field">
+            <div className="flex items-center gap-2">
+              <Label>Provider</Label>
+              {llmDirty && <Pill tone="accent" dot>unsaved</Pill>}
+            </div>
+            <ProviderSelector
+              value={form.llm.provider}
+              providerIds={data.llm?.providers || ['ollama']}
+              env={data.env}
+              onChange={changeLlmProvider}
+            />
+            <div className="field-hint">
+              {llmDirty
+                ? 'Provider changed. Hit "Save LLM provider" below to route every call here.'
+                : 'The provider every LLM call routes through. Switching reroutes instantly on save, no redeploy.'}
+            </div>
+          </div>
+
+          {form.llm.provider === 'ollama' && (
+            <div className="field">
+              <Label>Ollama server URL</Label>
+              <Input
+                value={form.llm.ollamaUrl}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setForm(f => ({ ...f, llm: { ...f.llm, ollamaUrl: e.target.value } }))
+                }
+                placeholder="http://localhost:11434"
+                className="max-w-[360px]"
+              />
+              <div className="field-hint">
+                Where the Ollama server runs. Leave blank for the default
+                (<code>http://localhost:11434</code>).
+              </div>
+            </div>
+          )}
+
+          {form.llm.provider === 'ollama' && (
+            <div className="field">
+              <Label>Context window (num_ctx)</Label>
+              <Input
+                type="number"
+                min={0}
+                step={1024}
+                value={form.llm.numCtx}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setForm(f => ({ ...f, llm: { ...f.llm, numCtx: Number(e.target.value) } }))
+                }
+                placeholder="16384"
+                className="max-w-[200px]"
+              />
+              <div className="field-hint">
+                Tokens of context for <strong>local</strong> Ollama models.
+                Ollama&apos;s own default is 4096, which is too small for the DJ
+                agent: the prompt gets truncated and the model fails to pick a
+                track (the &ldquo;agent did not call the done tool&rdquo; error).
+                16384 is a safe default for a 7&ndash;9B model on a 12GB GPU;
+                raise it for reasoning models, lower it on tight VRAM. Set 0 to
+                use Ollama&apos;s default. Ignored for <code>:cloud</code> models.
+              </div>
+            </div>
+          )}
+
+          {form.llm.provider === 'openai-compatible' && (
+            <div className="field">
+              <Label>Server base URL</Label>
+              <div className="flex flex-wrap gap-2">
+                <Btn onClick={() => { setCompatKeyInput(''); setResetCompatKey(true); setForm(f => ({ ...f, llm: { ...f.llm, compatibleMode: 'hosted', headers: [], providerBaseUrls: { ...f.llm.providerBaseUrls, 'openai-compatible': 'https://api.atlascloud.ai/v1' } } })); }}>
+                  Use Atlas Cloud
+                </Btn>
+                <Btn onClick={() => { setCompatKeyInput(''); setResetCompatKey(true); setForm(f => ({ ...f, llm: { ...f.llm, compatibleMode: 'hosted', headers: [], providerBaseUrls: { ...f.llm.providerBaseUrls, 'openai-compatible': '' } } })); }}>
+                  Use Azure OpenAI v1
+                </Btn>
+                <Btn onClick={() => { setCompatKeyInput(''); setResetCompatKey(true); setForm(f => ({ ...f, llm: { ...f.llm, compatibleMode: 'hosted', headers: [], providerBaseUrls: { ...f.llm.providerBaseUrls, 'openai-compatible': 'https://api.mistral.ai/v1' } } })); }}>
+                  Use Mistral
+                </Btn>
+              </div>
+              <Input
+                value={form.llm.providerBaseUrls['openai-compatible'] ?? ''}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setForm(f => ({ ...f, llm: { ...f.llm, providerBaseUrls: { ...f.llm.providerBaseUrls, 'openai-compatible': e.target.value } } }))
+                }
+                placeholder="http://192.168.1.101:8080/v1"
+                className="max-w-[360px]"
+              />
+              <div className="field-hint">
+                Include the <code>/v1</code> suffix. For Azure, enter
+                <code> https://YOUR-RESOURCE.openai.azure.com/openai/v1</code>,
+                then add an <code>api-key</code> custom header below and enter the
+                deployment name as the model. The Atlas preset fills its URL;
+                enter your key in the Bearer token field. The Mistral preset
+                fills <code>https://api.mistral.ai/v1</code>; enter your Mistral
+                API key in the Bearer token field. The URL must be
+                reachable from the controller container. A preset clears the
+                previous custom headers and saved compatible-provider Bearer
+                token on Save; primary and backup share that token.
+              </div>
+            </div>
+          )}
+
+          {form.llm.provider === 'openai-compatible' && (
+            <div className="field">
+              <Label>API behavior</Label>
+              <Seg value={form.llm.compatibleMode}
+                options={COMPAT_MODE_OPTIONS}
+                onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, compatibleMode: v as CompatMode } }))} />
+              <div className="field-hint">
+                Auto-detect asks the server what it is: llama.cpp, LM Studio, vLLM
+                or Ollama run as a local model; a cloud model or public API runs as
+                a hosted service; anything it cannot tell stays local. Hosted uses
+                native structured output and leaves sampling and reasoning controls
+                to the service. Local keeps the llama.cpp/vLLM request adjustments.
+                {compatDetectedNote(form.llm.compatibleMode, data.llm?.compatDetection?.primary)}
+              </div>
+            </div>
+          )}
+
+          {form.llm.provider === 'locca' && (
+            <div className="field">
+              <Label>locca server base URL</Label>
+              <Input
+                value={form.llm.providerBaseUrls['locca'] ?? ''}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setForm(f => ({ ...f, llm: { ...f.llm, providerBaseUrls: { ...f.llm.providerBaseUrls, locca: e.target.value } } }))
+                }
+                placeholder="http://host.docker.internal:8080/v1"
+                className="max-w-[360px]"
+              />
+              <div className="field-hint">
+                Leave blank to use the locca server on the host
+                (<code>http://host.docker.internal:8080/v1</code>). Override only
+                for a non-default port or a remote host. Bring a model up with{' '}
+                <code>locca serve &lt;model&gt; --yes</code>; the model id below is
+                what locca reports at <code>/v1/models</code>.{' '}
+                <a
+                  href="https://github.com/perminder-klair/locca"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-bold text-vermilion underline decoration-[1.5px] underline-offset-2"
+                >
+                  locca on GitHub ↗
+                </a>
+              </div>
+            </div>
+          )}
+
+          {INLINE_KEY_PROVIDERS.includes(form.llm.provider) && (
+            <>
+              <div className="field">
+                <Label>Bearer token</Label>
+                <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
+                  <Input
+                    type="password"
+                    autoComplete="off"
+                    value={compatKeyInput}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setCompatKeyInput(e.target.value)}
+                    placeholder={(data.values?.llm as { keys?: Record<string, unknown> })?.keys?.[form.llm.provider] === 'set' ? '•••••• (on file)' : 'Bearer token (optional)'}
+                    className="max-w-[360px]"
+                  />
+                  <Btn
+                    onClick={() =>
+                      testCompatKey(
+                        compatKeyInput || '',
+                        primaryTestBaseUrl,
+                        form.llm.model,
+                        setCompatKeyTesting,
+                        setCompatKeyTest,
+                        form.llm.headers,
+                      )
+                    }
+                    disabled={compatKeyTesting || !primaryTestBaseUrl.trim()}
+                  >
+                    {compatKeyTesting ? 'Testing…' : 'Test connection'}
+                  </Btn>
+                </div>
+                <div className="field-hint">
+                  Optional: only needed when the server requires bearer authentication
+                  (e.g. llama.cpp <code>--api-key</code>). Saved to{' '}
+                  <code>settings.json</code>, takes effect on next save.
+                </div>
+              </div>
+              {compatKeyTest && <KeyTestResult result={compatKeyTest} />}
+            </>
+          )}
+
+          {INLINE_KEY_PROVIDERS.includes(form.llm.provider) && (
+            <div className="field">
+              <Label>Custom request headers</Label>
+              <HeaderRowsEditor
+                idPrefix="llm-primary-header"
+                rows={form.llm.headers}
+                onChange={rows => setForm(f => ({ ...f, llm: { ...f.llm, headers: rows } }))}
+              />
+              <div className="field-hint">
+                Sent on every request to this server, on top of the bearer token.
+                Only needed for gateways that route on a header of their own —
+                e.g. OpenCode Zen Go requires <code>x-opencode-session</code>,
+                whose value only has to be opaque and stable. Leave empty for a
+                plain llama.cpp / vLLM / LM Studio server. Values are hidden once
+                saved; a row showing <code>•••••• (on file)</code> keeps its
+                stored value unless you retype it, and clearing a row&apos;s
+                value or removing the row drops the header.
+              </div>
+            </div>
+          )}
+
+          {(form.llm.provider === 'locca' || (form.llm.provider === 'openai-compatible' && effectiveCompatMode(form.llm.compatibleMode, data.llm?.compatDetection?.primary) === 'local')) && (
+            <div className="field">
+              <Label>Repetition penalty (repeat_penalty)</Label>
+              <Input
+                type="number"
+                min={1}
+                max={2}
+                step={0.05}
+                value={form.llm.repeatPenalty}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setForm(f => ({ ...f, llm: { ...f.llm, repeatPenalty: Number(e.target.value) } }))
+                }
+                placeholder="1.15"
+                className="max-w-[200px]"
+              />
+              <div className="field-hint">
+                Repetition penalty sent to the local server (llama.cpp, vLLM, LM
+                Studio). llama.cpp&apos;s own default is <code>1.0</code> = OFF,
+                which lets the track-picker agent run away repeating a token block
+                and never finish a pick. <strong>1.15</strong> is a sane floor;
+                raise toward 1.25 if a model still loops. Set <code>1.0</code> to
+                disable (e.g. a vLLM server that rejects the{' '}
+                <code>repeat_penalty</code> field; its name there is{' '}
+                <code>repetition_penalty</code>).
+              </div>
+            </div>
+          )}
+
+          {LLM_ENV_VARS[form.llm.provider] && (() => {
+            const keyVar = LLM_ENV_VARS[form.llm.provider]!;
+            return (
+              <>
+                <div className="field">
+                  <Label>{llmProviderLabel(form.llm.provider)} API key</Label>
+                  <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
+                    <Input
+                      type="password"
+                      autoComplete="off"
+                      value={primaryKeyInput}
+                      placeholder={data.env?.[keyVar] ? '•••••• (on file)' : (KEY_HINTS[keyVar] ?? '')}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setPrimaryKeyInput(e.target.value)}
+                      className="max-w-[360px]"
+                    />
+                    <Btn
+                      onClick={() => testKey(keyVar, primaryKeyInput, setPrimaryKeyTesting, setPrimaryKeyTest, () => setPrimaryKeyInput(''))}
+                      disabled={primaryKeyTesting || (!primaryKeyInput.trim() && !data.env?.[keyVar])}
+                    >
+                      {primaryKeyTesting ? 'Testing…' : 'Test key'}
+                    </Btn>
+                  </div>
+                  <div className="field-hint">
+                    Stored in <code>state/secrets.env</code>, takes effect immediately. Leave blank to keep the existing key.
+                  </div>
+                  {keyVar === 'OPENAI_API_KEY' && (
+                    <div className="field-hint">
+                      This key is shared across LLM and Cloud TTS.
+                    </div>
+                  )}
+                </div>
+                {primaryKeyTest && <KeyTestResult result={primaryKeyTest} />}
+              </>
+            );
+          })()}
+
+          <div className="field">
+            <Label>Model</Label>
+            <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
+              {primaryDiscovery.models.length > 0 ? (
+                <ModelCombobox
+                  allowCustom
+                  models={primaryDiscovery.models}
+                  value={form.llm.model}
+                  onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, model: v } }))}
+                  placeholder="Select a model"
+                />
+              ) : (
+                <Input
+                  value={form.llm.model}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                    setForm(f => ({ ...f, llm: { ...f.llm, model: e.target.value } }))
+                  }
+                  disabled={!primaryDiscoveryEnabled && form.llm.provider !== 'ollama'}
+                  placeholder={
+                    !primaryDiscoveryEnabled
+                      ? (form.llm.provider === 'openai-compatible' ? 'Set a base URL first' : 'Set an API key above to discover and select a model')
+                      : form.llm.provider === 'ollama'
+                        ? 'nemotron-3-super:cloud'
+                        : form.llm.provider === 'deepseek'
+                          ? 'deepseek-v4-flash'
+                          : form.llm.provider === 'openai-compatible' || form.llm.provider === 'locca'
+                            ? 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf'
+                            : 'model id'
+                  }
+                  className="max-w-[360px]"
+                />
+              )}
+              {primaryDiscovery.loading
+                ? <span className="animate-pulse text-[11px] whitespace-nowrap text-muted">discovering…</span>
+                : primaryDiscoveryEnabled && (
+                  <Btn onClick={primaryDiscovery.refresh} title="Refresh model list">↻</Btn>
+                )
+              }
+            </div>
+            <div className="field-hint">
+              {primaryDiscovery.models.length > 0
+                ? `${primaryDiscovery.models.length} model${primaryDiscovery.models.length !== 1 ? 's' : ''} discovered. Pick one or enter a model ID.`
+                : !primaryDiscoveryEnabled
+                  ? (form.llm.provider === 'openai-compatible'
+                      ? 'Set a base URL above to discover available models.'
+                      : 'Set an API key above to discover and select a model.')
+                  : primaryDiscovery.error
+                    ? `Discovery failed: ${primaryDiscovery.error}. Type a model ID manually.`
+                    : primaryDiscovery.loading
+                      ? 'Discovering models…'
+                      : 'No models discovered. Type a model ID manually.'}
+            </div>
+          </div>
+
+          {primaryKeyVar && (
+            <KeyStatus envVar={primaryKeyVar} present={!!data.env?.[primaryKeyVar]} />
+          )}
+
+          {form.llm.provider === 'openai-compatible' && (
+            <div className="field">
+              <Label>Forced tool calls</Label>
+              <Seg
+                accent
+                value={form.llm.toolChoice === 'auto' ? 'auto' : 'required'}
+                options={[
+                  { id: 'required', label: 'Required' },
+                  { id: 'auto', label: 'Auto' },
+                ]}
+                onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, toolChoice: v } }))}
+              />
+              <div className="field-hint">
+                How the picker forces the model to return a structured pick.
+                <code>Required</code> (default) sends{' '}
+                <code>tool_choice:&quot;required&quot;</code>, the reliable path for
+                local models. Switch to <code>Auto</code> only if your server
+                <strong> crashes</strong> on a tool call: some newer vLLM images
+                (notably Intel/XPU builds) mishandle the guided-decoding backend
+                that <code>required</code> engages, while <code>auto</code> never
+                does. On <code>Auto</code> a capable model still calls the tool;
+                misses fall back to the stateless picker. Claude Sonnet 5.5,
+                Opus 5.5 and Fable 5 refuse forced tool calls, so they always
+                run on <code>Auto</code> whatever this is set to.
+              </div>
+            </div>
+          )}
+        </div>
+      </Card>
+
+      <Advanced note="tuning, the fallback chain and the daily budget">
+      <Card title="Fallback" sub="backup when the primary is offline">
+        <div className="grid gap-[18px]">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-center sm:gap-4">
+            <div>
+              <div className="text-[13px] font-bold">Use a backup LLM</div>
+              <div className="mt-0.5 max-w-[480px] text-[14px] leading-[1.5] text-muted">
+                When the primary host can&apos;t be reached (connection refused,
+                DNS failure, timeout, e.g. a GPU box that&apos;s powered off), the
+                call is retried once against this backup, then routes straight back
+                to the primary on the next call. A primary that&apos;s up but busy
+                (rate-limited or erroring) is <em>not</em> failed over. Heavy work
+                like library tagging stays on the primary, so a smaller backup
+                model is fine here.
+              </div>
+            </div>
+            <Seg
+              accent
+              value={form.llm.fallback.enabled ? 'on' : 'off'}
+              options={[
+                { id: 'off', label: 'Off' },
+                { id: 'on', label: 'On' },
+              ]}
+              onChange={v =>
+                setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, enabled: v === 'on' } } }))
+              }
+            />
+          </div>
+
+          {form.llm.fallback.enabled && (
+            <>
+              <div className="field">
+                <Label>Backup provider</Label>
+                <Select
+                  value={form.llm.fallback.provider}
+                  onValueChange={v =>
+                    setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, provider: v } } }))
+                  }
+                >
+                  <SelectTrigger className="max-w-[360px]" aria-label="Backup provider"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {(data.llm?.providers || ['ollama']).map(p => (
+                        <SelectItem key={p} value={p}>{llmProviderLabel(p)}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <div className="field-hint">
+                  The provider to fall back to. Can differ from the primary, e.g.
+                  primary on a self-hosted box, backup on always-on Ollama.
+                </div>
+              </div>
+
+              {form.llm.fallback.provider === 'ollama' && (
+                <div className="field">
+                  <Label>Backup Ollama server URL</Label>
+                  <Input
+                    value={form.llm.fallback.ollamaUrl}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, ollamaUrl: e.target.value } } }))
+                    }
+                    placeholder="http://localhost:11434"
+                    className="max-w-[360px]"
+                  />
+                  <div className="field-hint">
+                    Where the backup Ollama server runs. Leave blank for the
+                    default (<code>http://localhost:11434</code>).
+                  </div>
+                </div>
+              )}
+
+              {form.llm.fallback.provider === 'ollama' && (
+                <div className="field">
+                  <Label>Backup context window (num_ctx)</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1024}
+                    value={form.llm.fallback.numCtx}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, numCtx: Number(e.target.value) } } }))
+                    }
+                    placeholder="16384"
+                    className="max-w-[200px]"
+                  />
+                  <div className="field-hint">
+                    Tokens of context for a <strong>local</strong> backup Ollama
+                    model. Set 0 for Ollama&apos;s default. Ignored for
+                    <code>:cloud</code> models.
+                  </div>
+                </div>
+              )}
+
+              {form.llm.fallback.provider === 'openai-compatible' && (
+                <div className="field">
+                  <Label>Backup server base URL</Label>
+                  <Input
+                    value={form.llm.fallback.providerBaseUrls['openai-compatible'] ?? ''}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, providerBaseUrls: { ...f.llm.fallback.providerBaseUrls, 'openai-compatible': e.target.value } } } }))
+                    }
+                    placeholder="http://192.168.1.101:8080/v1"
+                    className="max-w-[360px]"
+                  />
+                  <div className="field-hint">
+                    OpenAI-compatible server URL including the <code>/v1</code>
+                    suffix, required for this provider.
+                  </div>
+                </div>
+              )}
+
+              {form.llm.fallback.provider === 'openai-compatible' && (
+                <div className="field">
+                  <Label>Backup API behavior</Label>
+                  <Seg value={form.llm.fallback.compatibleMode}
+                    options={COMPAT_MODE_OPTIONS}
+                    onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, compatibleMode: v as CompatMode } } }))} />
+                  <div className="field-hint">
+                    {compatDetectedNote(form.llm.fallback.compatibleMode, data.llm?.compatDetection?.fallback)}
+                  </div>
+                </div>
+              )}
+
+              {form.llm.fallback.provider === 'locca' && (
+                <div className="field">
+                  <Label>Backup locca server base URL</Label>
+                  <Input
+                    value={form.llm.fallback.providerBaseUrls['locca'] ?? ''}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, providerBaseUrls: { ...f.llm.fallback.providerBaseUrls, locca: e.target.value } } } }))
+                    }
+                    placeholder="http://host.docker.internal:8080/v1"
+                    className="max-w-[360px]"
+                  />
+                  <div className="field-hint">
+                    Leave blank to use the locca server on the host
+                    (<code>http://host.docker.internal:8080/v1</code>). Override only
+                    for a non-default port or a remote host.
+                  </div>
+                </div>
+              )}
+
+              {INLINE_KEY_PROVIDERS.includes(form.llm.fallback.provider) && (
+                <>
+                  <div className="field">
+                    <Label>Bearer token</Label>
+                    <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
+                      <Input
+                        type="password"
+                        autoComplete="off"
+                        value={compatFallbackKeyInput}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setCompatFallbackKeyInput(e.target.value)}
+                        placeholder={(data.values?.llm as { keys?: Record<string, unknown> })?.keys?.[form.llm.fallback.provider] === 'set' ? '•••••• (on file)' : 'Bearer token (optional)'}
+                        className="max-w-[360px]"
+                      />
+                      <Btn
+                        onClick={() =>
+                          testCompatKey(
+                            compatFallbackKeyInput || '',
+                            fallbackTestBaseUrl,
+                            form.llm.fallback.model,
+                            setCompatFallbackKeyTesting,
+                            setCompatFallbackKeyTest,
+                            form.llm.fallback.headers,
+                          )
+                        }
+                        disabled={compatFallbackKeyTesting || !fallbackTestBaseUrl.trim()}
+                      >
+                        {compatFallbackKeyTesting ? 'Testing…' : 'Test connection'}
+                      </Btn>
+                    </div>
+                    <div className="field-hint">
+                      Optional: only needed when the backup server requires bearer
+                      authentication. Saved to <code>settings.json</code>, takes effect on
+                      next save.
+                    </div>
+                  </div>
+                  {compatFallbackKeyTest && <KeyTestResult result={compatFallbackKeyTest} />}
+                  <div className="field">
+                    <Label>Custom request headers</Label>
+                    <HeaderRowsEditor
+                      idPrefix="llm-fallback-header"
+                      rows={form.llm.fallback.headers}
+                      onChange={rows => setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, headers: rows } } }))}
+                    />
+                    <div className="field-hint">
+                      Per-leg, like the base URL: the backup may be a different
+                      gateway with its own routing header. Same rules as the
+                      primary leg above.
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {(form.llm.fallback.provider === 'locca' || (form.llm.fallback.provider === 'openai-compatible' && effectiveCompatMode(form.llm.fallback.compatibleMode, data.llm?.compatDetection?.fallback) === 'local')) && (
+                <div className="field">
+                  <Label>Repetition penalty (repeat_penalty)</Label>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={2}
+                    step={0.05}
+                    value={form.llm.fallback.repeatPenalty}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, repeatPenalty: Number(e.target.value) } } }))
+                    }
+                    placeholder="1.15"
+                    className="max-w-[200px]"
+                  />
+                  <div className="field-hint">
+                    Repetition penalty for the backup local server. <strong>1.15</strong>{' '}
+                    is a sane floor (llama.cpp&apos;s own default is <code>1.0</code> =
+                    off); set <code>1.0</code> to disable.
+                  </div>
+                </div>
+              )}
+
+              {form.llm.trackSelection === 'agentic' && (
+                <div className="field">
+                  <Label>Discovery rounds per pick</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={5}
+                    step={1}
+                    value={form.llm.fallback.discoverySteps}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, discoverySteps: Number(e.target.value) } } }))
+                    }
+                    placeholder="0"
+                    className="max-w-[200px]"
+                  />
+                  <div className="field-hint">
+                    The backup resolves its own budget, since it may be a different
+                    provider running a different model. <strong>0 = auto</strong>.
+                    Note the DJ is told how many rounds it has before a pick starts,
+                    and that promise has to hold on whichever leg ends up running &mdash;
+                    so the station uses the <em>lower</em> of the two numbers whenever
+                    the backup is enabled. 0&ndash;5.
+                  </div>
+                </div>
+              )}
+
+              {LLM_ENV_VARS[form.llm.fallback.provider] && (() => {
+                const keyVar = LLM_ENV_VARS[form.llm.fallback.provider]!;
+                return (
+                  <>
+                    <div className="field">
+                      <Label>{llmProviderLabel(form.llm.fallback.provider)} API key</Label>
+                      <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
+                        <Input
+                          type="password"
+                          autoComplete="off"
+                          value={fallbackKeyInput}
+                          placeholder={data.env?.[keyVar] ? '•••••• (on file)' : (KEY_HINTS[keyVar] ?? '')}
+                          onChange={(e: ChangeEvent<HTMLInputElement>) => setFallbackKeyInput(e.target.value)}
+                          className="max-w-[360px]"
+                        />
+                        <Btn
+                          onClick={() => testKey(keyVar, fallbackKeyInput, setFallbackKeyTesting, setFallbackKeyTest, () => setFallbackKeyInput(''))}
+                          disabled={fallbackKeyTesting || (!fallbackKeyInput.trim() && !data.env?.[keyVar])}
+                        >
+                          {fallbackKeyTesting ? 'Testing…' : 'Test key'}
+                        </Btn>
+                      </div>
+                      <div className="field-hint">
+                        Stored in <code>state/secrets.env</code>, takes effect immediately. Leave blank to keep the existing key.
+                      </div>
+                    </div>
+                    {fallbackKeyTest && <KeyTestResult result={fallbackKeyTest} />}
+                  </>
+                );
+              })()}
+
+              <div className="field">
+                <Label>Backup model</Label>
+                <div className="flex flex-wrap items-stretch gap-2 sm:flex-nowrap">
+                  {fallbackDiscovery.models.length > 0 ? (
+                    <ModelCombobox
+                      allowCustom
+                      models={fallbackDiscovery.models}
+                      value={form.llm.fallback.model}
+                      onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, model: v } } }))}
+                      placeholder="Select a model"
+                    />
+                  ) : (
+                    <Input
+                      value={form.llm.fallback.model}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                        setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, model: e.target.value } } }))
+                      }
+                      disabled={!fallbackDiscoveryEnabled && form.llm.fallback.provider !== 'ollama'}
+                      placeholder={
+                        !fallbackDiscoveryEnabled
+                          ? (form.llm.fallback.provider === 'openai-compatible' ? 'Set a base URL first' : 'Set an API key above to discover and select a model')
+                          : form.llm.fallback.provider === 'ollama'
+                            ? 'llama3.2:3b'
+                            : form.llm.fallback.provider === 'deepseek'
+                              ? 'deepseek-chat'
+                              : form.llm.fallback.provider === 'openai-compatible' || form.llm.fallback.provider === 'locca'
+                                ? 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf'
+                                : 'model id'
+                      }
+                      className="max-w-[360px]"
+                    />
+                  )}
+                  {fallbackDiscovery.loading
+                    ? <span className="animate-pulse text-[11px] whitespace-nowrap text-muted">discovering…</span>
+                    : fallbackDiscoveryEnabled && (
+                      <Btn onClick={fallbackDiscovery.refresh} title="Refresh model list">↻</Btn>
+                    )
+                  }
+                </div>
+                <div className="field-hint">
+                  {fallbackDiscovery.models.length > 0
+                    ? `${fallbackDiscovery.models.length} model${fallbackDiscovery.models.length !== 1 ? 's' : ''} discovered. Pick one or enter a model ID.`
+                    : !fallbackDiscoveryEnabled
+                      ? (form.llm.fallback.provider === 'openai-compatible'
+                          ? 'Set a base URL above to discover available models.'
+                          : 'Set an API key above to discover and select a model.')
+                      : fallbackDiscovery.error
+                        ? `Discovery failed: ${fallbackDiscovery.error}. Type a model ID manually.`
+                        : fallbackDiscovery.loading
+                          ? 'Discovering models…'
+                          : 'No models discovered. Type a model ID manually.'}
+                </div>
+              </div>
+
+              {fallbackKeyVar && (
+                <KeyStatus envVar={fallbackKeyVar} present={!!data.env?.[fallbackKeyVar]} />
+              )}
+
+              {form.llm.fallback.provider === 'openai-compatible' && (
+                <div className="field">
+                  <Label>Backup forced tool calls</Label>
+                  <Seg
+                    accent
+                    value={form.llm.fallback.toolChoice === 'auto' ? 'auto' : 'required'}
+                    options={[
+                      { id: 'required', label: 'Required' },
+                      { id: 'auto', label: 'Auto' },
+                    ]}
+                    onChange={v =>
+                      setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, toolChoice: v } } }))
+                    }
+                  />
+                  <div className="field-hint">
+                    The backup&rsquo;s own setting, as for the primary above: <code>Required</code>{' '}
+                    (default) is the reliable path for local models; switch to <code>Auto</code> only
+                    if this backup&rsquo;s server crashes on a tool call. It moves with the leg when
+                    you swap the primary and backup.
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-center sm:gap-4">
+                <div>
+                  <div className="text-[13px] font-bold">Backup chain-of-thought</div>
+                  <div className="mt-0.5 max-w-[480px] text-[14px] leading-[1.5] text-muted">
+                    {form.llm.fallback.provider === 'openai-compatible' && effectiveCompatMode(form.llm.fallback.compatibleMode, data.llm?.compatDetection?.fallback) === 'hosted'
+                      ? 'Hosted compatible services control their own reasoning; this switch is ignored for this backup.'
+                      : 'Whether the backup model may emit a reasoning step. Off by default, like the primary.'}
+                  </div>
+                </div>
+                <Seg
+                  accent
+                  value={form.llm.fallback.reasoning ? 'on' : 'off'}
+                  options={[
+                    { id: 'off', label: 'Off' },
+                    { id: 'on', label: 'On' },
+                  ]}
+                  onChange={v =>
+                    setForm(f => ({ ...f, llm: { ...f.llm, fallback: { ...f.llm.fallback, reasoning: v === 'on' } } }))
+                  }
+                />
+              </div>
+
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-center sm:gap-4">
+                <div>
+                  <div className="text-[13px] font-bold">Swap with primary</div>
+                  <div className="mt-0.5 max-w-[480px] text-[14px] leading-[1.5] text-muted">
+                    {unsavedChanges
+                      ? 'Save or discard your unsaved settings changes first (on any page of Settings): the swap saves straight away.'
+                      : 'Make this backup the primary, and the primary the backup. Each keeps its own settings, so swapping again swaps the two back.'}
+                  </div>
+                </div>
+                <Btn
+                  tone="accent"
+                  onClick={() => { void openSwap(); }}
+                  disabled={unsavedChanges || busy || swapping}
+                  title={unsavedChanges ? 'Unsaved changes in Settings' : undefined}
+                >
+                  {swapping ? 'Swapping…' : 'Swap with primary'}
+                </Btn>
+              </div>
+            </>
+          )}
+        </div>
+      </Card>
+
+      <Card title="Reasoning" sub="thinking models">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-center sm:gap-4">
+          <div>
+            <div className="text-[13px] font-bold">Chain-of-thought</div>
+            <div className="field-hint mt-1 max-w-[440px]">
+              {form.llm.provider === 'openai-compatible' && effectiveCompatMode(form.llm.compatibleMode, data.llm?.compatDetection?.primary) === 'hosted'
+                ? 'Hosted compatible services control their own reasoning; this switch is ignored for this connection.'
+                : <>When off, thinking-capable models skip their internal reasoning
+              step (Ollama, Qwen3, Gemini, OpenAI o-series/gpt-5, Claude,
+              DeepSeek). DJ scripts and structured picks are short, so thinking
+              mostly just adds latency and cost; leave it off unless your model
+              needs it. On Claude and DeepSeek, structured/tool calls always skip
+              thinking anyway, so the toggle only affects free-text lines there.</>}
+            </div>
+          </div>
+          <Seg
+            accent
+            value={form.llm.reasoning ? 'on' : 'off'}
+            options={[
+              { id: 'off', label: 'Off' },
+              { id: 'on', label: 'On' },
+            ]}
+            onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, reasoning: v === 'on' } }))}
+          />
+        </div>
+
+        <div className="field mt-4">
+          <Label>Max response size (tokens)</Label>
+          <Input
+            type="number"
+            min={0}
+            max={8000}
+            step={500}
+            value={form.llm.maxOutputTokens}
+            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+              setForm(f => ({ ...f, llm: { ...f.llm, maxOutputTokens: Math.min(8000, Math.max(0, Number(e.target.value))) } }))
+            }
+            placeholder="0"
+            className="max-w-[200px]"
+          />
+          <div className="field-hint">
+            Caps the tokens the model may generate per response: the size
+            of each reply, not a daily total. <strong>0 = use the built-in
+            defaults</strong> (the default). Set a value (500&ndash;8000) to
+            shrink it: useful on a local model with a small context window, where
+            an oversized allowance crowds out the system prompt and tool
+            list and risks truncation, especially with reasoning off, where
+            replies are short anyway. Values between 1 and 499 round up to 500.
+          </div>
+        </div>
+      </Card>
+
+      {form.llm.provider === 'google' && (
+        <Card title="Gemini safety filters" sub="primary model">
+          <GeminiSafetyEditor
+            value={form.llm.geminiSafety}
+            idPrefix="primary-gemini-safety"
+            onChange={(category, checked) => setForm(f => ({
+              ...f, llm: { ...f.llm, geminiSafety: { ...f.llm.geminiSafety, [category]: checked } },
+            }))}
+          />
+        </Card>
+      )}
+
+      {form.llm.fallback.enabled && form.llm.fallback.provider === 'google' && (
+        <Card title="Fallback Gemini safety filters" sub="backup model">
+          <GeminiSafetyEditor
+            value={form.llm.fallback.geminiSafety}
+            idPrefix="fallback-gemini-safety"
+            onChange={(category, checked) => setForm(f => ({
+              ...f,
+              llm: { ...f.llm, fallback: {
+                ...f.llm.fallback,
+                geminiSafety: { ...f.llm.fallback.geminiSafety, [category]: checked },
+              } },
+            }))}
+          />
+        </Card>
+      )}
+
+      <Card title="Idle behaviour" sub="when no one's listening">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-center sm:gap-4">
+          <div>
+            <div className="text-[13px] font-bold">Pause DJ when empty</div>
+            <div className="field-hint mt-1 max-w-[440px]">
+              When on, the DJ stops all LLM calls (picks, links, IDs, hourly,
+              segments, requests) while Icecast reports zero listeners. The stream
+              keeps playing from the auto playlist, and the DJ resumes the moment
+              someone tunes in.
+            </div>
+          </div>
+          <Seg
+            accent
+            value={form.llm.pauseWhenEmpty ? 'on' : 'off'}
+            options={[
+              { id: 'off', label: 'Off' },
+              { id: 'on', label: 'On' },
+            ]}
+            onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, pauseWhenEmpty: v === 'on' } }))}
+          />
+        </div>
+      </Card>
+
+      <Card title="Daily token budget" sub="cap LLM spend per day">
+        <div className="field">
+          <Label>Daily token cap</Label>
+          <Input
+            type="number"
+            min={0}
+            step={10000}
+            value={form.llm.dailyTokenCap}
+            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+              setForm(f => ({ ...f, llm: { ...f.llm, dailyTokenCap: Math.max(0, Number(e.target.value)) } }))
+            }
+            placeholder="0"
+            className="max-w-[200px]"
+          />
+          <div className="field-hint">
+            Hard ceiling on tokens the DJ may spend per day (UTC), counted from
+            the same usage stats as the token ticker. <strong>0 = unlimited</strong>
+            {' '}(the default; leave it off for a free local model). When set,
+            the DJ drops to the cheap picker and mutes optional segments as it
+            nears the cap, then stops calling the model entirely and coasts on the
+            auto playlist once it&rsquo;s hit; music never stops.
+          </div>
+        </div>
+
+        {form.llm.dailyTokenCap > 0 && (
+          <div className="field mt-4">
+            <Label>Soft threshold (%)</Label>
+            <Input
+              type="number"
+              min={0}
+              max={100}
+              step={5}
+              value={form.llm.budgetSoftPct}
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setForm(f => ({ ...f, llm: { ...f.llm, budgetSoftPct: Math.min(100, Math.max(0, Number(e.target.value))) } }))
+              }
+              placeholder="80"
+              className="max-w-[200px]"
+            />
+            <div className="field-hint">
+              At this percent of the cap the DJ enters the cheap tier: stateless
+              pool picks, no links or station IDs, no weather/news/etc. 0 or 100
+              disables the soft tier (straight to the hard cap).
+            </div>
+          </div>
+        )}
+
+        {form.llm.dailyTokenCap > 0 && (
+          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-center sm:gap-4">
+            <div>
+              <div className="text-[13px] font-bold">Always answer requests</div>
+              <div className="mt-0.5 max-w-[480px] text-[14px] leading-[1.5] text-muted">
+                When on, listener requests are still answered by the AI DJ even
+                over the cap; a human asked, so honour it. When off,
+                requests over the cap fall back to plain library matching like
+                everything else.
+              </div>
+            </div>
+            <Seg
+              accent
+              value={form.llm.exemptRequests ? 'on' : 'off'}
+              options={[
+                { id: 'off', label: 'Off' },
+                { id: 'on', label: 'On' },
+              ]}
+              onChange={v => setForm(f => ({ ...f, llm: { ...f.llm, exemptRequests: v === 'on' } }))}
+            />
+          </div>
+        )}
+      </Card>
+      </Advanced>
+
+      <SaveBar
+        note={`Active model: ${data.llm?.active}. Applies to the next LLM call, no restart needed.`}
+        busy={busy}
+        onSave={save}
+        saveLabel="Save LLM provider"
+        errors={fieldErrors}
+        ownedKeys={LLM_PROVIDER_FORM_KEYS}
+        // All four key boxes are component-local — the panel diffs FormState
+        // and cannot see them, so a pasted key alone would leave the section
+        // "clean" and unmount the very button that saves it. The managed pair
+        // has a Test-and-save path too; the compat pair only has this button.
+        dirty={!!(
+          primaryKeyInput.trim() || fallbackKeyInput.trim()
+          || compatKeyInput.trim() || compatFallbackKeyInput.trim()
+        )}
+      />
+
+      <V3AlertDialog
+        open={swapOpen}
+        onOpenChange={(o) => { if (!o && !swapping) setSwapOpen(false); }}
+        title="Swap primary and backup LLM"
+        description={
+          <>
+            <strong>{llmProviderLabel(form.llm.fallback.provider)}</strong>
+            {form.llm.fallback.model ? <> / <code>{form.llm.fallback.model}</code></> : null}
+            {' '}becomes the primary, and{' '}
+            <strong>{llmProviderLabel(form.llm.provider)}</strong>
+            {form.llm.model ? <> / <code>{form.llm.model}</code></> : null}
+            {' '}the backup. Each keeps its own settings, and the change is saved at once.
+          </>
+        }
+        details={<><SwapFitNotice fit={swapFit} /><SwapPinNotice fit={swapFit} /></>}
+        confirmLabel="swap"
+        cancelLabel="cancel"
+        onConfirm={() => { void confirmSwap(); }}
+      />
+
+      <V3AlertDialog
+        open={embedPinNotice != null}
+        onOpenChange={(o) => { if (!o) setEmbedPinNotice(null); }}
+        title="Embeddings kept on your library's model"
+        description={embedPinNotice ? (
+          <>
+            Your library is embedded with <code>{embedPinNotice.model}</code> ({embedPinNotice.dim}-d
+            vectors). Embeddings were following the chat provider, so switching to{' '}
+            <strong>{llmProviderLabel(embedPinNotice.newProvider)}</strong> would have changed the
+            embedding model too; a different model produces incompatible vectors, breaking
+            library / vibe search until you re-embed every track.
+            {' '}To keep search working, embeddings are now <strong>pinned</strong> to{' '}
+            <code>{embedPinNotice.model}</code> (Library tagger → Embedding). Switch embeddings to
+            the new provider instead? You’ll need to re-embed the whole library afterwards.
+          </>
+        ) : ''}
+        confirmLabel="switch embeddings too"
+        cancelLabel="keep pinned"
+        danger
+        onConfirm={() => {
+          setForm(f => (f ? { ...f, embedding: { ...f.embedding, provider: '', model: '' } } : f));
+          setEmbedPinNotice(null);
+        }}
+      />
+    </>
+  );
+}
+
+/** GET /settings/llm/swap/fit (controller settings/llm-swap-fit.ts, plus the
+ *  route's preview of the embedding pins). */
+interface SwapFit {
+  agenticRoutes: string[];
+  target: { provider: string; model: string };
+  warnings: { check: string; detail: string }[];
+  embedding?: SwapEmbeddingPreview;
+}
+
+/** The swap dialog's Library-tagger line. A pin is written once and stays:
+ *  swapping back restores the two LLM legs, not the embedding leg's
+ *  inheritance, so the operator is told before it happens. */
+function SwapPinNotice({ fit }: { fit: SwapFit | 'error' | null }) {
+  if (fit === null) return null;
+  if (fit === 'error' || !fit.embedding) {
+    return (
+      <div className="mt-3 text-[12px] leading-[1.5] text-muted">
+        Library tagger values inherited from the primary are pinned to their current values, so the
+        library&rsquo;s vectors keep their model.
+      </div>
+    );
+  }
+  const { pinned, keyNotPinned } = fit.embedding;
+  if (!pinned.length && !keyNotPinned) return null;
+  return (
+    <div role="note" className="mt-3 text-[12px] leading-[1.5]">
+      {pinned.length > 0 && (
+        <div>
+          The Library tagger follows the primary for its {pinnedFieldNames(pinned)}. The swap
+          pins {pinned.length === 1 ? 'it' : 'them'} to today&rsquo;s values so the library&rsquo;s
+          vectors keep their model. Swapping back does not undo this: clear the field in Library
+          tagger to follow the primary again.
+        </div>
+      )}
+      {keyNotPinned && (
+        <div className={pinned.length > 0 ? 'mt-1' : undefined}>
+          The primary&rsquo;s API key is too long for the Library tagger to store, so it is not
+          pinned. If embeddings stop working after the swap, set an embedding key in Library tagger.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The swap dialog's warning: which agentic routes the incoming primary may
+ *  not suit, and why. Never blocks the swap — the same engine already takes
+ *  those routes on a failover. */
+function SwapFitNotice({ fit }: { fit: SwapFit | 'error' | null }) {
+  if (fit === null) {
+    return <div className="mt-3 text-[12px] text-muted">Checking the agentic routes…</div>;
+  }
+  if (fit === 'error') {
+    return <div className="mt-3 text-[12px] text-muted">Could not check the agentic routes against the backup.</div>;
+  }
+  if (!fit.warnings.length) return null;
+  const who = fit.target.model || llmProviderLabel(fit.target.provider);
+  return (
+    <div role="note" className="mt-3 border border-[var(--warn,var(--accent))] px-3 py-2 text-[12px] leading-[1.5]">
+      <div className="font-bold text-[color:var(--warn,var(--accent))]">
+        {who} may not suit the agentic routes
+      </div>
+      <div className="mt-1">
+        Agentic: {fit.agenticRoutes.join(', ')}.
+      </div>
+      <ul className="m-0 mt-1 list-disc pl-4">
+        {fit.warnings.map(w => (
+          <li key={w.check + w.detail}><strong>{w.check}</strong>: {w.detail}.</li>
+        ))}
+      </ul>
+      <div className="mt-1 text-muted">
+        The swap still goes through. These routes are set in Settings → Music selection and DJ behaviour,
+        not on this page, and the backup already takes them over on a failover.
+      </div>
+    </div>
+  );
+}

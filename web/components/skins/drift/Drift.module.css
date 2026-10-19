@@ -1,0 +1,54 @@
+/* Register --sw-drift-c for colour transitions. Unsupported browsers switch instantly. */
+
+@property --sw-drift-c {
+  syntax: '<color>';
+  inherits: false;
+  initial-value: transparent;
+}
+
+.wash {
+  position: absolute;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, var(--sw-drift-c), transparent);
+  transition: --sw-drift-c 20s linear;
+  pointer-events: none;
+  will-change: transform;
+}
+
+/* Support explicit dark themes and dark OS preferences without a theme override. */
+:global([data-theme='dark']) .wash {
+  filter: saturate(1.35) brightness(1.2);
+}
+@media (prefers-color-scheme: dark) {
+  :global(:root:not([data-theme='light'])) .wash {
+    filter: saturate(1.35) brightness(1.2);
+  }
+}
+
+/* Disable this full-screen gradient transition explicitly; global lite rules disable only keyframes. */
+:global(html.lite) .wash {
+  transition: none;
+}
+
+@keyframes drift-a {
+  to { transform: translate(34px, 22px) scale(1.06); }
+}
+@keyframes drift-b {
+  to { transform: translate(-28px, -30px) scale(1.04); }
+}
+@keyframes drift-c {
+  to { transform: translate(20px, -18px) scale(1.08); }
+}
+
+.washA { animation: drift-a 90s ease-in-out infinite alternate; }
+.washB { animation: drift-b 110s ease-in-out infinite alternate; }
+.washC { animation: drift-c 130s ease-in-out infinite alternate; }
+
+@keyframes drift-breathe {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.breathe {
+  animation: drift-breathe 6s ease-in-out infinite;
+}

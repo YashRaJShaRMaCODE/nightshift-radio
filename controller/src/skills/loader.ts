@@ -1,0 +1,515 @@
+import { loadedCapabilities as readCapabilities, replaceLoadedCapabilities } from './registry.js';
+// Skill loader — the single source of truth for the DJ's between-track segment
+// capabilities. Every skill, shipped or operator-added, is a self-contained
+// directory under ONE runtime load root, ${STATE_DIR}/skills/<slug>/:
+//
+//   <slug>/
+//     SKILL.md     frontmatter (→ metadata) + body (→ the agent's brief)
+//     tool.mjs     OPTIONAL: a data fetcher the segment director calls first
+//
+// The seven built-ins are not special at load time: they are *seeded* into
+// state/skills on first boot from read-only templates that ship in the image
+// (src/skills/builtins/<kind>/, see scaffold.js → seedBuiltinSkills), then loaded
+// exactly like an operator skill. The only residue of "built-in" is the
+// SEEDED_KINDS set (the shipped kinds), which drives a few first-party
+// affordances — enabled-by-default, can't-hard-delete, reset-to-default, and
+// reserved naming — NOT a separate load path or trust posture.
+//
+// A skill's tool.mjs is the same contract for everyone:
+//   export default async (ctx, state, services, config, input) => data
+//   export const description = '…'   // OPTIONAL: tool description for the agent
+//   export const ready = (services) => boolean   // OPTIONAL: gate availability
+//   export const inputs = { query: '…' }   // OPTIONAL: agent-steerable string
+//     params ({ name: description }); validated values arrive as `input`
+//   export const requiresData = false   // OPTIONAL: opt out of the grounding
+//     rule — this skill writes a line even when its tool returns nothing
+//     usable (skills/abstain-policy.ts). Default: a skill with a data tool
+//     stands down rather than inventing. Operator's `requiresData:`
+//     frontmatter line, when present, outranks this.
+//   export const configFields = { feed: { type: 'url', label: '…' } } // OPTIONAL:
+//     operator-editable knobs (skills/config-fields.ts). Values live in this
+//     skill's OWN frontmatter and arrive as `config`, so a copied/renamed skill
+//     keeps its settings form — see issue #1300 (bug 11)
+//
+// A skill with NO tool.mjs is not necessarily prompt-only: a `feed:` line in its
+// own frontmatter earns it the generic feed tool (skills/feed.ts), the same
+// `skill_<name>` fetch + dedupe the built-in news skill used to hand-roll. That
+// is the whole of issue #1616 — the field validated, saved and read back
+// everywhere while reaching the model as nothing at all. News ships no tool.mjs
+// any more; it takes this path like every other feed skill.
+//
+// `services` (station-services.ts) is the curated facade onto search, the
+// library, the play log, feeds and durable recall — the one way a tool reaches
+// the world. Every tool runs behind a timeout + try/catch at the call site
+// (llm/segment-tools.js), seeded or operator-authored alike.
+//
+// Safety posture (operator code in state/skills is the operator's own, same
+// trust model as a local Claude Code skill, but still fenced):
+//   - malformed skills are skipped with a logged warning, never crash boot
+//   - operator (non-seeded) skills are DISCOVERED-BUT-DISABLED — they appear in
+//     /admin/skills toggled off and cannot air until the operator enables them
+//   - every tool.mjs runs behind a timeout + try/catch (llm/segment-tools.js)
+//   - code that ARRIVED from elsewhere (zip import, backup restore) sits beside
+//     SKILL.md as tool.mjs.pending, which this loader never imports. Being
+//     disabled is not enough on its own: a scan imports every tool.mjs, enabled
+//     or not, and the catalog calls each one's ready(). Only the operator's
+//     explicit trust (skills/install.ts) renames it into place.
+
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { parse as parseYaml } from 'yaml';
+import { join, resolve, dirname } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { STATE_DIR } from '../config.js';
+import { queue, registerSkillKinds } from '../broadcast/queue.js';
+import { buildStationServices } from '../llm/internal/tools/station-services.js';
+import { parseConfigFields, type SkillConfigField } from './config-fields.js';
+import { FEED_CONFIG_FIELDS, makeFeedTool, resolveFeedConfig } from './feed.js';
+import { declaredBool } from './abstain-policy.js';
+import {
+  SKILL_SLUG_RE,
+  SKILL_TAG_RE,
+  TAGS_PER_SKILL_LIMIT,
+  normalizeSkillTags,
+} from '../schemas/skill.js';
+
+// Shipped built-in TEMPLATE store, resolved relative to this module so it works
+// under both dev (tsx on bind-mounted src) and prod (tsx on the COPYd src). This
+// is NOT a runtime load root — it is read only by the seeder + reset route
+// (scaffold.js). Exported so those can resolve template files.
+export const BUILTINS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), 'builtins');
+// The COMMUNITY skill catalog is no longer shipped in the image — it's fetched
+// live from the `community` repo. listCommunitySkills / readCommunitySkill
+// (re-exported below) delegate to community/registry.ts; every route + admin-UI
+// consumer is unchanged.
+const SKILLS_DIR = resolve(STATE_DIR, 'skills');
+
+// The data tool the loader imports, and the quarantined spelling it never does.
+export const TOOL_FILE = 'tool.mjs';
+export const PENDING_TOOL_FILE = 'tool.mjs.pending';
+
+// Custom-skill slug: lowercase, starts alphanumeric, then alphanumeric/hyphen,
+// ≤49 chars. Anchored, so it can't contain '/', '.', or whitespace — the routes
+// rely on that to keep a slug from escaping state/skills/. Now homed in the
+// shared skill schema (mirrored into the admin UI) and re-exported here under
+// its historical name, so every call site is unchanged.
+export const SLUG_RE = SKILL_SLUG_RE;
+
+// Kinds the queue reserves for its own voice channels — a custom skill may not
+// shadow these (seeded kinds are added below, once discovered). 'jingle' and
+// 'default' are the station-voice kinds in audio/tts.ts: a skill announcing
+// under one would speak outside the persona rules every other skill gets.
+const QUEUE_INTERNAL_KINDS = ['link', 'dj-speak', 'announcement', 'station-id', 'hourly', 'hourly-check', 'jingle', 'default'];
+
+// Derived at boot from the template directories. Exported as live sets that
+// callers (.has()) read after boot. `SEEDED_KINDS` is the set of shipped kinds;
+// `RESERVED_KINDS` adds the queue-internal kinds a custom skill can't shadow.
+export const SEEDED_KINDS = new Set<string>();
+export const RESERVED_KINDS = new Set<string>(QUEUE_INTERNAL_KINDS);
+
+let importCounter = 0;        // cache-buster for re-importing edited tool.mjs
+
+// The full live capability set — seeded built-ins and operator skills, loaded on
+// identical footing. Read live so a rescan takes effect without a restart.
+export function loadedCapabilities(): any[] { return readCapabilities(); }
+
+// Frontmatter parsing. SKILL.md is operator-authored — by hand on disk as much
+// as through /admin/skills — so the block is parsed as REAL YAML rather than by
+// the flat `key: value` line splitter this module shipped with. That splitter
+// silently mangled anything an operator would reasonably write: a list
+// (`tags:\n  - factual`) parsed as an empty value and then dropped every entry,
+// a `#` comment mid-value survived into the value, and a block scalar became
+// one key with the literal text `|-`.
+//
+// `data` stays a flat Record<string, string> — every consumer downstream (the
+// tool's 4th `config` arg, config-fields coercion, preservedFrontmatter,
+// parseTags) is built on strings, and widening that contract is a much larger
+// change than the parse itself. Lists flatten to the comma-joined form those
+// consumers already accept, so `tags: [a, b]` and `tags: a, b` now mean the
+// same thing. Nested maps have no consumer and are dropped.
+//
+// A block YAML REFUSES falls back to the legacy line parser rather than
+// failing the skill: the sharp case is an unquoted colon (`label: News: Today`),
+// which the old parser accepted and which therefore exists on operators' disks
+// today. `malformed` carries the YAML error so loadSkillDir can warn — the
+// operator should fix it, but not by having their skill vanish at boot.
+
+function flattenFrontmatterValue(value: unknown): string | null {
+  if (value == null) return '';
+  if (Array.isArray(value)) {
+    const parts = value.map(flattenFrontmatterValue).filter((p): p is string => p !== null && p !== '');
+    return parts.join(', ');
+  }
+  if (typeof value === 'object') return null; // nested map — no consumer speaks it
+  return String(value).trim();
+}
+
+// The pre-YAML parser, kept as the fallback for blocks YAML rejects.
+function parseFrontmatterLines(block: string): Record<string, string> {
+  const data: Record<string, string> = {};
+  for (const line of block.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf(':');
+    if (idx === -1) continue;
+    const key = trimmed.slice(0, idx).trim();
+    let val = trimmed.slice(idx + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (key) data[key] = val;
+  }
+  return data;
+}
+
+export function parseFrontmatter(raw: string): { data: Record<string, string>; body: string; malformed?: string } {
+  const text = raw.replace(/^﻿/, '');
+  const m = /^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/.exec(text);
+  if (!m) return { data: {}, body: text.trim() };
+  const body = m[2].trim();
+
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(m[1]);
+  } catch (err: any) {
+    return { data: parseFrontmatterLines(m[1]), body, malformed: String(err?.message || err).split('\n')[0] };
+  }
+  // A scalar or list at the top level isn't frontmatter — same posture as YAML
+  // refusing it outright, so fall back rather than returning nothing.
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { data: parseFrontmatterLines(m[1]), body };
+  }
+
+  const data: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const flat = flattenFrontmatterValue(value);
+    if (flat !== null) data[String(key).trim()] = flat;
+  }
+  return { data, body };
+}
+
+// "90m" | "6h" | "2d" | "45s" | "45" (bare = minutes) → ms. Defaults to 60 min.
+function parseCooldownMs(raw: string | undefined): number {
+  const def = 60 * 60 * 1000;
+  if (!raw) return def;
+  const m = /^(\d+)\s*([smhd]?)$/.exec(String(raw).trim());
+  if (!m) return def;
+  const n = Number(m[1]);
+  const unit = m[2] || 'm';
+  const mult = unit === 's' ? 1000 : unit === 'h' ? 3600_000 : unit === 'd' ? 86_400_000 : 60_000;
+  return n * mult;
+}
+
+function titleCase(slug: string): string {
+  return slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// Parse a `context:` (or `contextFields:`) comma list into lowercase tokens, or
+// undefined when absent/empty (→ the default profile downstream, see #471).
+function parseContextFields(raw: string | undefined): string[] | undefined {
+  if (raw == null) return undefined;
+  const list = String(raw).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  return list.length ? list : undefined;
+}
+
+// Freeform organisation tags (`tags: late-night, factual`) — operator vocabulary
+// for filtering the admin skill list. Lowercase slugs, deduped, capped; invalid
+// entries are dropped (lenient, like every other frontmatter field). The rules
+// and the lenient parse both live in the shared skill schema now, beside the
+// strict form-side `skillTagsSchema` that refuses what this one drops.
+export { SKILL_TAG_RE as TAG_RE, TAGS_PER_SKILL_LIMIT };
+export const parseTags = normalizeSkillTags;
+
+// A shipped built-in template, read on demand by the seeder / reset route /
+// admin "defaults" payload. The template FILES are never kept resident.
+export interface SkillTemplate {
+  kind: string;
+  skillMd: string;            // raw SKILL.md text (for verbatim seeding)
+  data: Record<string, string>;
+  body: string;
+  toolPath: string | null;    // absolute path to tool.mjs, or null (prompt-only)
+}
+
+// Read a shipped template's files. Returns null when there's no such template.
+export async function readTemplate(kind: string): Promise<SkillTemplate | null> {
+  const dir = join(BUILTINS_DIR, kind);
+  let skillMd: string;
+  try {
+    skillMd = await readFile(join(dir, 'SKILL.md'), 'utf8');
+  } catch {
+    return null;
+  }
+  const { data, body } = parseFrontmatter(skillMd);
+  let toolPath: string | null = join(dir, 'tool.mjs');
+  try { await stat(toolPath); } catch { toolPath = null; }
+  return { kind, skillMd, data, body, toolPath };
+}
+
+// The community skill catalog now lives in the `community` repo and is
+// fetched live (community/registry.ts). `CommunitySkill` + the list/read
+// accessors are re-exported here unchanged so routes/dj.ts + routes/public.ts +
+// the admin UI keep importing them from this module.
+export type { CommunitySkill } from '../community/registry.js';
+export { communitySkills as listCommunitySkills, readCommunitySkill } from '../community/registry.js';
+
+// Discover the shipped kinds from the template dir names and (re)build the
+// derived SEEDED_KINDS / RESERVED_KINDS sets. Cheap — readdir only; the template
+// FILES are read on demand. Runs once at boot (templates are static).
+export async function discoverSeededKinds(): Promise<Set<string>> {
+  SEEDED_KINDS.clear();
+  try {
+    const dirents = await readdir(BUILTINS_DIR, { withFileTypes: true });
+    for (const d of dirents) if (d.isDirectory()) SEEDED_KINDS.add(d.name);
+  } catch (err: any) {
+    queue.log('error', `[skills] could not read built-in templates ${BUILTINS_DIR}: ${err?.message || err}`);
+  }
+  RESERVED_KINDS.clear();
+  for (const k of QUEUE_INTERNAL_KINDS) RESERVED_KINDS.add(k);
+  for (const k of SEEDED_KINDS) RESERVED_KINDS.add(k);
+  return SEEDED_KINDS;
+}
+
+// A tool.mjs `inputs` export declares agent-steerable string parameters:
+// a flat { paramName: 'description for the agent' } object. Sanitised here —
+// only identifier-shaped keys with string descriptions survive, so a malformed
+// export narrows to nothing instead of breaking the tool-call JSON schema.
+const INPUT_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]{0,48}$/;
+function sanitizeToolInputs(raw: any): Record<string, string> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (INPUT_KEY_RE.test(k) && typeof v === 'string' && v.trim()) out[k] = v.trim();
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+// Dynamically import a skill's optional tool.mjs. Returns the data function plus
+// its optional `description` / `ready` / `inputs` / `configFields` exports, or
+// null when there's no tool.
+async function loadToolModule(dir: string): Promise<{ fn: any; description?: string; ready?: any; inputs?: Record<string, string>; configFields?: SkillConfigField[]; requiresData?: boolean } | null> {
+  const file = join(dir, TOOL_FILE);
+  try {
+    await stat(file);
+  } catch {
+    return null; // no tool.mjs — pure-generation skill, that's fine
+  }
+  // Cache-bust so a rescan picks up an edited module (ESM caches by URL).
+  const url = `${pathToFileURL(file).href}?v=${++importCounter}`;
+  const mod = await import(url);
+  const fn = mod.default || mod.fetchData || mod.tool;
+  if (typeof fn !== 'function') {
+    throw new Error('tool.mjs must export a default async function (ctx, state, services, config, input) => data');
+  }
+  return {
+    fn,
+    description: typeof mod.description === 'string' ? mod.description : undefined,
+    ready: typeof mod.ready === 'function' ? mod.ready : undefined,
+    inputs: sanitizeToolInputs(mod.inputs),
+    configFields: parseConfigFields(mod.configFields),
+    // OPTIONAL: `export const requiresData = false` opts a skill out of the
+    // grounding rule — "no external item" is my cue to write one myself, not to
+    // stay quiet. Left undefined when undeclared, so skills/abstain-policy.ts
+    // falls through to its default rather than reading an absent export as a
+    // deliberate `false`.
+    requiresData: declaredBool(mod.requiresData),
+  };
+}
+
+// The agent-facing tool name for a skill. One spelling, shared by the tool.mjs
+// path and the generic feed path.
+function toolNameFor(name: string): string {
+  return `skill_${name.replace(/-/g, '_')}`;
+}
+
+// The generic feed knobs, sanitised once through the same parser a tool.mjs
+// declaration goes through — the built-in path and the operator path must not
+// disagree about what a config field may say.
+const FEED_FIELDS = parseConfigFields(FEED_CONFIG_FIELDS);
+
+// Build a full capability from a skill directory. `seeded` controls the
+// first-party affordances (enabled-by-default, can't-delete, reset) — NOT the
+// trust posture: every loaded tool runs fenced at the call site, seeded or not.
+async function loadSkillDir(dir: string, slug: string, { seeded }: { seeded: boolean }): Promise<any | null> {
+  let raw: string;
+  try {
+    raw = await readFile(join(dir, 'SKILL.md'), 'utf8');
+  } catch {
+    return null; // directory without a SKILL.md — not a skill
+  }
+  const { data, body, malformed } = parseFrontmatter(raw);
+  if (malformed) {
+    // Parsed by the legacy line fallback, so the skill still loads — but an
+    // operator editing this file will keep hitting it (a list or block scalar
+    // added below the offending line reads as nothing), so say so once per scan.
+    queue.log('warn', `[skills] "${slug}" SKILL.md frontmatter is not valid YAML — read with the legacy parser: ${malformed}`);
+  }
+  const name = (data.name || slug).trim();
+  if (!SLUG_RE.test(name)) {
+    queue.log('error', `[skills] "${slug}" rejected — name "${name}" must be a lowercase slug`);
+    return null;
+  }
+  // A seeded built-in always ships a brief; an operator skill must supply one.
+  if (!seeded && !body) {
+    queue.log('error', `[skills] "${slug}" rejected — SKILL.md body (the agent's brief) is empty`);
+    return null;
+  }
+
+  const requiresKey = data.requiresKey ? String(data.requiresKey).trim() : null;
+
+  let toolMod: any = null;
+  try {
+    toolMod = await loadToolModule(dir);
+  } catch (err: any) {
+    queue.log('error', `[skills] "${slug}" tool.mjs failed to load — running prompt-only: ${err.message}`);
+    toolMod = null;
+  }
+  // Quarantined code is only ever stat'ed here, never imported.
+  let toolPending = false;
+  try { await stat(join(dir, PENDING_TOOL_FILE)); toolPending = true; } catch { /* none waiting */ }
+
+  const label = (data.label || titleCase(name)).trim();
+  const cap: any = {
+    kind: name,
+    skill: name,
+    label,
+    cooldownMs: parseCooldownMs(data.cooldown),
+    desc: body,
+    // Provenance, NOT trust: a shipped kind (seeded into state) vs an operator
+    // skill. Drives enabled-by-default + the admin delete/reset affordances.
+    seeded,
+    window: data.window === 'commute' ? 'commute' : 'any',
+    requiresKey,
+    // Absent → effectiveContextFields() falls back to the default profile (#471).
+    contextFields: parseContextFields(data.context ?? data.contextFields),
+    // Freeform organisation tags for the admin skill list.
+    tags: parseTags(data.tags),
+    // The skill's own frontmatter, handed to the tool as its 4th arg so a skill
+    // can read its own knobs (e.g. news' feed / feedMaxItems).
+    config: data,
+    // Cron expression — when set, the scheduler registers a dedicated cron that
+    // fires this skill on that schedule, bypassing frequency/cooldown gating (same
+    // posture as the operator override). Stored raw; scheduler validates + registers.
+    cronExpression: data.cron ? String(data.cron).trim() : undefined,
+    // When true, withheld from the autonomous director's random selection
+    // (availableCapabilities() in skills/_agent.ts) — fires ONLY on its cron
+    // timer. Meaningless without a cron expression, but read independently so
+    // a skill that later loses its cron line doesn't silently start firing at
+    // random again without the operator noticing the coupled field too.
+    cronOnly: String(data.cronOnly).trim().toLowerCase() === 'true',
+    // Disk loading stays lenient: only the literal YAML/string true opts in.
+    // False, absent and malformed values preserve the historical solo path.
+    cohosts: String(data.cohosts).trim().toLowerCase() === 'true',
+    // Operator-editable knobs this skill declares for itself (tool.mjs
+    // `configFields`, or the generic feed pair for a skill without a tool.mjs).
+    // Drives the admin editor's settings section — see config-fields.ts. Empty
+    // only for a skill whose tool.mjs declares none.
+    configFields: [] as SkillConfigField[],
+    // A tool.mjs.pending waits for the operator's review (skills/install.ts).
+    toolPending,
+  };
+
+  // Readiness: a tool module's `ready(services)` wins; else a keyed skill is
+  // ready only when its env var is set; else always ready. A skill whose ONLY
+  // data tool is still awaiting review is not ready: it was written to speak
+  // from that tool's data, and airing it from the brief alone would have the
+  // DJ invent what the tool was meant to fetch.
+  if (toolPending && !toolMod) {
+    cap.ready = () => false;
+  } else if (toolMod?.ready) {
+    cap.ready = () => toolMod.ready(buildStationServices());
+  } else if (requiresKey) {
+    cap.ready = () => !!process.env[requiresKey];
+  }
+
+  if (toolMod?.fn) {
+    cap.toolFn = toolMod.fn;
+    cap.toolName = toolNameFor(name);
+    cap.toolDesc = (toolMod.description || data.toolDescription || '').trim()
+      || `Fetch live data for the ${label} segment before speaking. Returns { available: false } when there is nothing fresh worth airing.`;
+    // Optional agent-steerable parameters ({ name: description }, strings
+    // only) — becomes the tool's input schema in llm/segment-tools.js and is
+    // handed to toolFn as its 5th argument. Absent → zero-arg tool, the
+    // historical shape.
+    cap.toolInputs = toolMod.inputs;
+    // Operator knobs travel with the tool, not the kind — a duplicated skill
+    // copies tool.mjs and keeps its settings form (#1300).
+    cap.configFields = toolMod.configFields || [];
+    // Whether a forced run may stand down when this tool returns nothing usable
+    // (issue #1412). Tri-state on purpose: undefined means the skill didn't say,
+    // and abstain-policy.ts decides. `cap.config` already carries the operator's
+    // own `requiresData:` frontmatter line, which outranks this.
+    cap.requiresData = toolMod.requiresData;
+  } else if (toolPending) {
+    // Nothing to offer until the code is trusted: its configFields are declared
+    // by the module itself, and the generic feed tool would stand in for code
+    // the operator has not read yet. SKILL.md knobs survive a save regardless
+    // (preservedFrontmatter in scaffold.ts).
+  } else {
+    // No tool.mjs — but a declared `feed:` is a fetch, not a decoration (#1616).
+    // Every knob the generic tool reads is offered to a skill in this branch
+    // whether or not it has set one, because the edit sheet is where an operator
+    // sets the first feed: fields that appear only once a value exists are a
+    // form you cannot use to create the value.
+    cap.configFields = FEED_FIELDS;
+    const { feed, warnings } = resolveFeedConfig(data);
+    for (const warning of warnings) queue.log('warn', `[skills] "${slug}" ${warning}`);
+    if (feed) {
+      cap.toolFn = makeFeedTool(name, feed);
+      cap.toolName = toolNameFor(name);
+      cap.toolDesc = (data.toolDescription || '').trim()
+        || `Fetch the latest items from the ${label} feed before speaking. Returns only items not already used on air, or { available: false } when none are left.`;
+      // requiresData is left undeclared, so abstain-policy.ts applies its
+      // default: a skill speaking from a feed stands down when the fetch fails
+      // or nothing fresh is left on it.
+    }
+  }
+
+  return cap;
+}
+
+// Scan the single load root (state/skills) and rebuild the live capability set.
+// Never throws — a broken folder is logged and skipped. Ensures the seeded kinds
+// are discovered first (so folders classify correctly). Returns the loaded caps.
+export async function loadSkills(): Promise<any[]> {
+  if (!SEEDED_KINDS.size) await discoverSeededKinds();
+  let entries: string[] = [];
+  try {
+    const dirents = await readdir(SKILLS_DIR, { withFileTypes: true });
+    entries = dirents.filter(d => d.isDirectory()).map(d => d.name);
+  } catch {
+    replaceLoadedCapabilities([]); // no state/skills dir yet → nothing to load
+    registerSkillKinds([]);
+    return loadedCapabilities();
+  }
+
+  const out: any[] = [];
+  const seen = new Set<string>();
+  for (const slug of entries) {
+    try {
+      // A folder shadowing a queue-internal kind (link/dj-speak/…) is rejected.
+      // Seeded kinds live in RESERVED_KINDS too but are legitimate, so exempt them.
+      if (RESERVED_KINDS.has(slug) && !SEEDED_KINDS.has(slug)) {
+        queue.log('error', `[skills] "${slug}" rejected — shadows a reserved capability`);
+        continue;
+      }
+      const cap = await loadSkillDir(join(SKILLS_DIR, slug), slug, { seeded: SEEDED_KINDS.has(slug) });
+      if (!cap) continue;
+      if (seen.has(cap.kind)) {
+        queue.log('error', `[skills] duplicate skill kind "${cap.kind}" — keeping the first`);
+        continue;
+      }
+      seen.add(cap.kind);
+      out.push(cap);
+    } catch (err: any) {
+      queue.log('error', `[skills] "${slug}" failed to load: ${err.message}`);
+    }
+  }
+
+  replaceLoadedCapabilities(out);
+  // Register every loaded kind as a recap voice/dedupe kind, so the DJ's
+  // anti-repeat memory covers them without a hand-maintained list.
+  registerSkillKinds(out.map(c => c.kind));
+  const seededN = out.filter(c => c.seeded).length;
+  const customN = out.length - seededN;
+  queue.log('scheduler', `[skills] loaded ${out.length} skill(s): ${seededN} built-in, ${customN} custom`);
+  return loadedCapabilities();
+}

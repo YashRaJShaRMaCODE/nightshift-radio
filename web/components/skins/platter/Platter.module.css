@@ -1,0 +1,74 @@
+
+@keyframes platter-spin { to { transform: rotate(360deg); } }
+@keyframes platter-sheen { to { transform: rotate(360deg); } }
+@keyframes platter-rim { to { transform: rotate(360deg); } }
+@keyframes platter-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.28; } }
+
+.record,
+.sheen,
+.rim,
+.pulse {
+  animation-play-state: paused;
+}
+.playing {
+  animation-play-state: running;
+}
+
+/* Keep .rim and .record durations equal so the mat and record rotate together. */
+.record { animation: platter-spin 5.9s linear infinite; }
+.sheen {
+  animation: platter-sheen 11.8s linear infinite;
+  mix-blend-mode: screen;
+  background: conic-gradient(
+    from 210deg,
+    rgba(255, 255, 255, 0) 0deg,
+    rgba(255, 255, 255, 0.16) 42deg,
+    rgba(255, 255, 255, 0) 96deg,
+    rgba(255, 255, 255, 0) 250deg,
+    rgba(255, 255, 255, 0.11) 296deg,
+    rgba(255, 255, 255, 0) 344deg
+  );
+}
+.rim { animation: platter-rim 5.9s linear infinite; }
+.pulse { animation: platter-pulse 2.4s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .record,
+  .sheen,
+  .rim,
+  .pulse {
+    animation: none;
+  }
+}
+
+/* Deliberately off-token: a record is black in every theme. */
+.vinyl {
+  background:
+    repeating-radial-gradient(
+      circle at 50% 50%,
+      rgba(255, 255, 255, 0.05) 0 1px,
+      rgba(0, 0, 0, 0) 1px 3px
+    ),
+    radial-gradient(circle at 50% 50%, #1c1815 0 35%, #0c0a09 36% 100%);
+  box-shadow:
+    inset 0 0 55px rgba(0, 0, 0, 0.85),
+    0 16px 42px rgba(0, 0, 0, 0.35);
+}
+
+/* Match transform-origin to the pivot in PlatterSkin.tsx. Ease the one-second --pf updates over 1.1s. */
+.arm {
+  transform-origin: 86% 19%;
+  transition: transform 1.1s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.armRest { transform: rotate(-24deg); }
+.armLive { transform: rotate(calc(-14deg + var(--pf, 0) * 22deg)); }
+
+.progFill { width: calc(var(--pf, 0) * 100%); }
+.progHead { left: calc(var(--pf, 0) * 100%); }
+
+/* Vertical fader: --vf (0..1), measured from the top as (1 - vf). */
+.faderFill { top: calc((1 - var(--vf, 0)) * 100%); }
+.faderThumb { top: calc((1 - var(--vf, 0)) * 100%); }
+
+.chipRow { scrollbar-width: none; }
+.chipRow::-webkit-scrollbar { display: none; }

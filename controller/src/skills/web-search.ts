@@ -1,0 +1,336 @@
+// All providers return { answer, results: [{ title, content }] } behind a 30-minute memo.
+// DDG instant answers may be empty; Tavily/Brave need keys; SearXNG needs a base URL.
+// Brave supports artist-name queries (#623); searxngEngines pins only these calls (#1353).
+
+import { config } from '../config.js';
+import * as settings from '../settings.js';
+import { fetchWithTimeout } from '../util/fetch-timeout.js';
+import { BoundedKeyMap } from '../util/bounded-key-map.js';
+
+const TAVILY_ENDPOINT = 'https://api.tavily.com/search';
+const DDG_ENDPOINT = 'https://api.duckduckgo.com/';
+const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
+
+type SearchResult = { title: string; content: string };
+type SearchResponse = { answer: string; results: SearchResult[] };
+
+// 30-min TTL cache keyed by `${provider}:${query}`. BOUNDED: the request path's
+// identifyRequestedTrack searches on a listener's free-text description, so the
+// key space is open-ended. Expired entries go first when the cap is reached, then
+// the least recently written.
+const CACHE_TTL_MS = 30 * 60 * 1000;
+const CACHE_MAX_KEYS = 256;
+const cache = new BoundedKeyMap<{ val: SearchResponse; at: number }>({
+  maxKeys: CACHE_MAX_KEYS,
+  isLive: (rec, now) => now - rec.at < CACHE_TTL_MS,
+});
+
+// Test seam.
+export function searchCacheSize(): number {
+  return cache.size;
+}
+
+async function memo(
+  key: string,
+  ttl: number,
+  fn: () => Promise<SearchResponse>,
+): Promise<SearchResponse> {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < ttl) return hit.val;
+  const val = await fn();
+  cache.set(key, { val, at: Date.now() });
+  return val;
+}
+
+export async function tavilySearch(query: string): Promise<SearchResponse> {
+  const apiKey = settings.get().search?.apiKey || process.env.SEARCH_API_KEY || config.search.apiKey;
+  const res = await fetchWithTimeout(TAVILY_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      query,
+      search_depth: 'basic',
+      topic: 'general',
+      include_answer: true,
+      max_results: 5,
+    }),
+    timeoutMs: 30_000,
+  });
+  if (!res.ok) throw new Error(`Tavily HTTP ${res.status}`);
+  const data: any = await res.json();
+  return {
+    answer: String(data.answer || '').trim(),
+    results: Array.isArray(data.results)
+      ? data.results.map((r: any) => ({
+          title: String(r.title || ''),
+          content: String(r.content || ''),
+        }))
+      : [],
+  };
+}
+
+// DuckDuckGo Instant Answer API. Returns sparse results — useful for well-known
+// entities (artists with a Wikipedia infobox, common nouns) and silent for most
+// other queries. We map `AbstractText` to the answer slot, and prefer
+// `RelatedTopics[*].Text` for sources.
+//
+// Setting `no_html=1` strips HTML from AbstractText/RelatedTopics; `skip_disambig=1`
+// avoids the "did you mean…" disambiguation pages, which never contain useful
+// detail. We send a real User-Agent — DDG silently 200s with an empty body
+// otherwise.
+//
+// The deadline matters more here than on the other backends: this is the
+// DEFAULT provider (see searchWeb below), and DDG is known to accept a
+// connection and then hold it, which without a timeout parks the request on
+// undici's ~300s default. memo() only caches AFTER the call resolves, so
+// concurrent duplicate queries each open their own socket rather than sharing
+// one.
+export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
+  const url = new URL(DDG_ENDPOINT);
+  url.searchParams.set('q', query);
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('no_html', '1');
+  url.searchParams.set('skip_disambig', '1');
+  url.searchParams.set('no_redirect', '1');
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      'User-Agent': 'SUB-WAVE radio controller (https://github.com/perminder-klair/subwave)',
+    },
+    timeoutMs: 30_000,
+  });
+  if (!res.ok) throw new Error(`DuckDuckGo HTTP ${res.status}`);
+  const data: any = await res.json();
+  const answer = String(data.AbstractText || data.Abstract || '').trim();
+  const topics = Array.isArray(data.RelatedTopics) ? data.RelatedTopics : [];
+  const results: SearchResult[] = [];
+  for (const t of topics) {
+    if (!t) continue;
+    if (Array.isArray(t.Topics)) {
+      // Grouped category — flatten one level deep.
+      for (const sub of t.Topics) {
+        if (sub && typeof sub.Text === 'string' && sub.Text.trim()) {
+          results.push({
+            title: String(sub.Name || data.Heading || ''),
+            content: sub.Text.trim(),
+          });
+        }
+        if (results.length >= 5) break;
+      }
+    } else if (typeof t.Text === 'string' && t.Text.trim()) {
+      results.push({
+        title: String(t.Name || data.Heading || ''),
+        content: t.Text.trim(),
+      });
+    }
+    if (results.length >= 5) break;
+  }
+  return { answer, results: results.slice(0, 5) };
+}
+
+// SearXNG meta-search backend. Self-hosted, no API key — needs only a
+// reachable base URL stored in settings.search.baseUrl. Threads optional
+// recency through to SearXNG's time_range param (artist-news callsite
+// passes 'week' to bias toward fresh content).
+export async function searxngSearch(
+  query: string,
+  recency?: 'day' | 'week' | 'month',
+): Promise<SearchResponse> {
+  const baseUrl = (settings.get().search?.baseUrl || '').trim();
+  if (!baseUrl) throw new Error('SearXNG baseUrl not configured');
+
+  const url = buildSearxngUrl({
+    baseUrl,
+    query,
+    recency,
+    engines: settings.get().search?.searxngEngines || '',
+  });
+
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      'User-Agent': 'SUB-WAVE radio controller (https://github.com/perminder-klair/subwave)',
+    },
+    timeoutMs: 30_000,
+  });
+  if (!res.ok) throw new Error(`SearXNG HTTP ${res.status}`);
+  const data = await res.json();
+  return parseSearxngResponse(data);
+}
+
+// Pure URL builder for a SearXNG query. Exported alongside parseSearxngResponse
+// so the query shape can be pinned without mocking fetch.
+//
+// `engines` is the optional operator pin (settings.search.searxngEngines, #1353):
+// a comma-separated list of SearXNG `name:` fields, sent as SearXNG's per-request
+// `engines=` param so one instance can serve a narrow, deterministic engine set
+// to the controller while browser traffic keeps the instance-wide defaults.
+// Empty means the param is omitted entirely — the pre-#1353 behaviour.
+export function buildSearxngUrl(opts: {
+  baseUrl: string;
+  query: string;
+  recency?: 'day' | 'week' | 'month';
+  engines?: string;
+}): URL {
+  const url = new URL('/search', opts.baseUrl);
+  url.searchParams.set('q', opts.query);
+  url.searchParams.set('format', 'json');
+  if (opts.recency) url.searchParams.set('time_range', opts.recency);
+  const engines = (opts.engines || '').trim();
+  if (engines) url.searchParams.set('engines', engines);
+  return url;
+}
+
+// Pure parser for SearXNG's JSON response. Maps the SearXNG shape
+// (results[], answers[], infoboxes[]) onto SubWave's SearchResponse contract.
+// Exported separately from searxngSearch() so fixture-based tests can pin
+// the mapping without mocking fetch. Tolerant of malformed input — any
+// shape mismatch yields { answer: '', results: [] }.
+export function parseSearxngResponse(data: unknown): SearchResponse {
+  if (!data || typeof data !== 'object') return { answer: '', results: [] };
+  const d = data as Record<string, unknown>;
+
+  // answer slot: prefer first infobox content, else empty.
+  let answer = '';
+  const infoboxes = Array.isArray(d.infoboxes) ? d.infoboxes : [];
+  if (infoboxes.length > 0 && infoboxes[0] && typeof infoboxes[0] === 'object') {
+    const ib = infoboxes[0] as Record<string, unknown>;
+    if (typeof ib.content === 'string') answer = ib.content.trim();
+  }
+
+  const rawResults = Array.isArray(d.results) ? d.results : [];
+  const results: SearchResult[] = [];
+  for (const r of rawResults) {
+    if (!r || typeof r !== 'object') continue;
+    const rec = r as Record<string, unknown>;
+    const title = typeof rec.title === 'string' ? rec.title.trim() : '';
+    const content = typeof rec.content === 'string' ? rec.content.trim().slice(0, 300) : '';
+    if (!title || !content) continue;
+    results.push({ title, content });
+    if (results.length >= 10) break;
+  }
+
+  return { answer, results };
+}
+
+// Brave Search API backend (issue #623). Keyed like Tavily — the key lives in
+// settings.search.apiKey with SEARCH_API_KEY as the env fallback. Threads
+// optional recency through Brave's `freshness` param (pd/pw/pm), and asks for
+// undecorated snippets (text_decorations=0) so descriptions arrive as plain
+// text instead of <strong>-highlighted HTML.
+export async function braveSearch(
+  query: string,
+  recency?: 'day' | 'week' | 'month',
+): Promise<SearchResponse> {
+  const apiKey = settings.get().search?.apiKey || process.env.SEARCH_API_KEY || config.search.apiKey;
+  if (!apiKey) throw new Error('Brave Search API key not configured');
+
+  const url = new URL(BRAVE_ENDPOINT);
+  url.searchParams.set('q', query);
+  url.searchParams.set('count', '10');
+  url.searchParams.set('text_decorations', '0');
+  if (recency) {
+    url.searchParams.set('freshness', { day: 'pd', week: 'pw', month: 'pm' }[recency]);
+  }
+
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      Accept: 'application/json',
+      'X-Subscription-Token': apiKey,
+    },
+    timeoutMs: 30_000,
+  });
+  if (!res.ok) throw new Error(`Brave Search HTTP ${res.status}`);
+  const data = await res.json();
+  return parseBraveResponse(data);
+}
+
+// Strips residual markup from Brave snippets. text_decorations=0 removes the
+// highlighting, but descriptions can still carry entities (&#x27; etc.) and
+// the occasional stray tag depending on the source page.
+function braveText(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/<[^>]+>/g, '')
+    .replace(/&#(x?)([0-9a-fA-F]+);/g, (whole, x: string, digits: string) => {
+      const code = parseInt(digits, x ? 16 : 10);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : whole;
+    })
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .trim();
+}
+
+// Pure parser for Brave's web-search JSON. Maps the Brave shape (web.results[],
+// news.results[], infobox) onto SubWave's SearchResponse contract. News results
+// lead — the artist-news callsite is the whole point of this provider — then
+// web results fill the remainder. Exported separately from braveSearch() so
+// fixture-based tests can pin the mapping without mocking fetch. Tolerant of
+// malformed input — any shape mismatch yields { answer: '', results: [] }.
+export function parseBraveResponse(data: unknown): SearchResponse {
+  if (!data || typeof data !== 'object') return { answer: '', results: [] };
+  const d = data as Record<string, unknown>;
+  const sub = (v: unknown, key: string): unknown =>
+    v && typeof v === 'object' ? (v as Record<string, unknown>)[key] : undefined;
+
+  // answer slot: the infobox's long description when Brave recognises the
+  // entity. `infobox.results` has been observed as both an object and a
+  // one-element array — accept either.
+  const ibRaw = sub(d.infobox, 'results');
+  const ib = Array.isArray(ibRaw) ? ibRaw[0] : ibRaw;
+  const answer = braveText(sub(ib, 'long_desc') || sub(ib, 'description'));
+
+  const results: SearchResult[] = [];
+  const push = (r: unknown) => {
+    if (!r || typeof r !== 'object' || results.length >= 10) return;
+    const rec = r as Record<string, unknown>;
+    const title = braveText(rec.title);
+    const content = braveText(rec.description).slice(0, 300);
+    if (!title || !content) return;
+    results.push({ title, content });
+  };
+  const newsResults = sub(d.news, 'results');
+  const webResults = sub(d.web, 'results');
+  for (const r of Array.isArray(newsResults) ? newsResults : []) push(r);
+  for (const r of Array.isArray(webResults) ? webResults : []) push(r);
+
+  return { answer, results };
+}
+
+// Provider dispatcher — reads the active provider from live settings on every
+// call so admin-UI changes take effect immediately. Wraps the backend in a
+// 30-min memo. Cache key includes recency so two callsites with different
+// recency hints don't share results.
+export async function searchWeb(
+  query: string,
+  opts?: { recency?: 'day' | 'week' | 'month' },
+): Promise<SearchResponse> {
+  const provider = settings.get().search?.provider || 'duckduckgo';
+  const recency = opts?.recency;
+  const key = `${provider}:${recency || ''}:${query.toLowerCase()}`;
+  return memo(key, CACHE_TTL_MS, () => {
+    if (provider === 'searxng') return searxngSearch(query, recency);
+    if (provider === 'tavily') return tavilySearch(query);
+    if (provider === 'brave') return braveSearch(query, recency);
+    return duckduckgoSearch(query);
+  });
+}
+
+// True when the active search provider is usable right now.
+//   duckduckgo:   always ready (no key, no URL)
+//   tavily/brave: needs settings.search.apiKey, or SEARCH_API_KEY env
+//   searxng:      needs settings.search.baseUrl (no env fallback by design)
+export function searchReady(): boolean {
+  const s = settings.get().search;
+  const provider = s?.provider || 'duckduckgo';
+  if (provider === 'duckduckgo') return true;
+  if (provider === 'searxng') return !!(s?.baseUrl && s.baseUrl.trim());
+  // tavily / brave (and any future keyed provider)
+  return !!(s?.apiKey || process.env.SEARCH_API_KEY || config.search.apiKey);
+}

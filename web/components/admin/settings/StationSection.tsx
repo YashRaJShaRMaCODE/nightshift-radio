@@ -1,0 +1,552 @@
+'use client';
+
+import type { ChangeEvent } from 'react';
+import { useEffect, useState } from 'react';
+import { fmtClockMinute, normalizeStationLocale, type StationLocale } from '../../../lib/format';
+import { Input } from '../../ui/input';
+import { Label } from '../../ui/label';
+import {
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel,
+} from '../../ui/select';
+import { Card, Btn, Pill, Seg } from '../ui';
+import { Advanced } from './section-chrome';
+import { LocationPicker, type GeocodeResult } from '../../LocationPicker';
+import {
+  SectionHeader, SaveBar, SettingsFieldError,
+  type SectionProps,
+} from './shared';
+
+// Intl.supportedValuesOf exists in every runtime this UI supports; the guard keeps
+// an exotic browser from crashing the whole settings page.
+const TZ_GROUPS: Array<{ region: string; zones: string[] }> = (() => {
+  let zones: string[] = [];
+  try { zones = Intl.supportedValuesOf('timeZone'); } catch { /* select offers Auto only */ }
+  const byRegion = new Map<string, string[]>();
+  for (const z of zones) {
+    const region = z.includes('/') ? z.slice(0, z.indexOf('/')) : 'Other';
+    if (!byRegion.has(region)) byRegion.set(region, []);
+    byRegion.get(region)!.push(z);
+  }
+  return [...byRegion.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([region, zs]) => ({ region, zones: zs }));
+})();
+
+// Wall-clock preview for a zone, or '' when the zone can't be formatted.
+function clockPreview(timeZone: string, locale: StationLocale) {
+  return fmtClockMinute(new Date(), timeZone || undefined, locale);
+}
+
+const ON_OFF = [
+  { id: 'on', label: 'On' },
+  { id: 'off', label: 'Off' },
+] as const;
+
+export function StationSection({ data, form, setForm, busy, saveSettings, fieldErrors }: SectionProps) {
+  // Persisted state, for the "restart required" pill and the password placeholder.
+  const authOnFile = data.values?.privacy?.listenerAuth === true;
+  const passwordOnFile = data.values?.privacy?.password === 'set';
+  const save = () => saveSettings({
+    station: form.station,
+    stationDescription: form.stationDescription,
+    timezone: form.timezone,
+    locale: form.locale,
+    weather: {
+      lat: parseFloat(form.weather.lat),
+      lng: parseFloat(form.weather.lng),
+      locationName: form.weather.locationName,
+      onAirLocation: form.weather.onAirLocation,
+      units: form.weather.units,
+    },
+    privacy: {
+      privatePlayer: form.privacy.privatePlayer,
+      listenerAuth: form.privacy.listenerAuth,
+      // 'set' is the redaction sentinel: the controller ignores it, so an untouched
+      // field never clobbers the stored password.
+      password: form.privacy.password,
+      publishPersonaSouls: form.privacy.publishPersonaSouls,
+    },
+    requests: {
+      enabled: form.requests.enabled,
+      maxPending: parseInt(form.requests.maxPending, 10),
+      cooldownSec: parseInt(form.requests.cooldownSec, 10),
+      perIpHourlyCap: parseInt(form.requests.perIpHourlyCap, 10),
+      globalHourlyCap: parseInt(form.requests.globalHourlyCap, 10),
+      repeatCooldownMin: parseInt(form.requests.repeatCooldownMin, 10),
+      onePendingPerIp: form.requests.onePendingPerIp,
+    },
+  });
+
+  // Re-render every 30s so the station-clock preview keeps walking.
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setClockTick(t => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const serverTz = data.serverTimezone || 'server timezone';
+  // '' = Auto → preview the server's zone, which is what the station runs on.
+  const previewTz = form.timezone || data.serverTimezone || '';
+  const preview = clockPreview(previewTz, form.locale);
+  const localeLabel = form.locale === 'en-US' ? 'English (US)' : 'English (UK)';
+
+  // A picked city's IANA zone is *suggested*, not written: the operator may have
+  // deliberately set a different station clock.
+  const [tzSuggestion, setTzSuggestion] = useState<string | null>(null);
+  const handleGeocodePick = (r: GeocodeResult) => {
+    const effective = form.timezone || data.serverTimezone || '';
+    setTzSuggestion(r.timezone && r.timezone !== effective ? r.timezone : null);
+  };
+  // Radix Select needs a matching <SelectItem> to render a value, so a picked zone
+  // outside TZ_GROUPS gets a fallback item.
+  const tzInGroups = !form.timezone || TZ_GROUPS.some(g => g.zones.includes(form.timezone));
+
+  return (
+    <>
+      <SectionHeader
+        eyebrow="station"
+        title="How the DJ identifies this radio on air."
+        sub="The station name is substituted into the DJ prompt as {station}. The location is the point the Open-Meteo forecast is read for, and stays private to this page. The on-air location is what the DJ actually says and what public listeners see; set it to a broader area if you'd rather not name your exact town. The timezone sets the clock the DJ lives on; locale controls how station times are displayed. All apply live, no mixer restart."
+        metrics={[
+          { n: data.values?.station || 'SUB/WAVE', l: 'station', accent: true },
+        ]}
+      />
+
+      <Card title="Station identity" sub="What the DJ calls this radio on air, and how shared links describe it">
+        <div className="field">
+          <Label>Station name</Label>
+          <Input
+            placeholder="SUB/WAVE"
+            value={form.station}
+            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+              setForm(f => ({ ...f, station: e.target.value }))
+            }
+            className="w-[260px] max-w-full"
+            maxLength={80}
+          />
+          <SettingsFieldError path="station" errors={fieldErrors} />
+          <div className="field-hint">
+            Substituted into the DJ prompt’s {'{station}'} placeholder (current: {data.values?.station || 'SUB/WAVE'}). Applies live.
+          </div>
+        </div>
+
+        <div className="field">
+          <Label>Share description</Label>
+          <Input
+            placeholder="A short line describing your station…"
+            value={form.stationDescription}
+            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+              setForm(f => ({ ...f, stationDescription: e.target.value }))
+            }
+            className="w-full"
+            maxLength={200}
+          />
+          <SettingsFieldError path="stationDescription" errors={fieldErrors} />
+          <div className="field-hint">
+            The blurb shown when someone shares a link to this station on social
+            media or chat. Stays the same whoever is on air; leave it empty and
+            the preview falls back to the current DJ’s tagline, which changes
+            with the schedule. Never read on air. {form.stationDescription.length}/200.
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Station location" sub="Private forecast point + what the DJ says on air">
+        <div className="field">
+          <Label>Location</Label>
+          <LocationPicker
+            variant="admin"
+            value={{
+              locationName: form.weather.locationName,
+              lat: form.weather.lat,
+              lng: form.weather.lng,
+            }}
+            onChange={next =>
+              setForm(f => ({ ...f, weather: { ...f.weather, ...next } }))
+            }
+            onPick={handleGeocodePick}
+          />
+          {tzSuggestion ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-[13px]">
+              <span className="text-muted-foreground">
+                Set station timezone to <span className="text-foreground">{tzSuggestion}</span>?
+              </span>
+              <Btn
+                onClick={() => {
+                  setForm(f => ({ ...f, timezone: tzSuggestion }));
+                  setTzSuggestion(null);
+                }}
+              >
+                Apply
+              </Btn>
+              <button
+                type="button"
+                className="text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setTzSuggestion(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          ) : null}
+          <div className="field-hint">
+            The point the Open-Meteo forecast is read for (current: {data.values?.weather?.locationName} @ {data.values?.weather?.lat}, {data.values?.weather?.lng}).
+            Stays on this page: never spoken on air, never returned by a public
+            endpoint. Applies live.
+          </div>
+        </div>
+
+        <div className="field">
+          <Label>On-air location <span className="text-muted-foreground">(optional)</span></Label>
+          <Input
+            placeholder="e.g. the Peak District"
+            value={form.weather.onAirLocation}
+            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+              setForm(f => ({ ...f, weather: { ...f.weather, onAirLocation: e.target.value } }))
+            }
+            className="w-[260px] max-w-full"
+            maxLength={80}
+          />
+          <div className="field-hint">
+            What the DJ says on air and what listeners see: the {'{location}'} placeholder, plus
+            the location in the public now-playing and DJ responses. Leave blank to use the
+            location above (currently saying{' '}
+            <span className="text-foreground">
+              {data.values?.weather?.onAirLocation || data.values?.weather?.locationName}
+            </span>
+            ). Set a broader area if pairing your station name with your exact town would identify
+            you; the forecast still reads the precise coordinates. Applies live; the DJ may still
+            reference the old name until the current session rolls.
+          </div>
+        </div>
+
+        <div className="field">
+          <Label>Weather units</Label>
+          <Select
+            value={form.weather.units}
+            onValueChange={val =>
+              setForm(f => ({
+                ...f,
+                weather: { ...f.weather, units: val === 'imperial' ? 'imperial' : 'metric' },
+              }))
+            }
+          >
+            <SelectTrigger className="w-[240px] max-w-full" aria-label="Weather units"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="metric">Metric (°C)</SelectItem>
+                <SelectItem value="imperial">Imperial (°F)</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <div className="field-hint">
+            What the DJ announces on air (current: {data.values?.weather?.units === 'imperial' ? 'Imperial / °F' : 'Metric / °C'}). Applies live.
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Timezone" sub="The station clock the DJ lives on">
+        <div className="field">
+          <Label>Station timezone</Label>
+          <Select
+            // Radix forbids empty-string item values, so Auto rides a sentinel.
+            value={form.timezone || 'auto'}
+            onValueChange={val =>
+              setForm(f => ({ ...f, timezone: val === 'auto' ? '' : val }))
+            }
+          >
+            <SelectTrigger className="w-[300px] max-w-full" aria-label="Station timezone"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="auto">Auto, server timezone ({serverTz})</SelectItem>
+              </SelectGroup>
+              {/* Radix needs an item to display a zone outside these groups. */}
+              {!tzInGroups ? (
+                <SelectGroup>
+                  <SelectItem value={form.timezone}>{form.timezone}</SelectItem>
+                </SelectGroup>
+              ) : null}
+              {TZ_GROUPS.map(g => (
+                <SelectGroup key={g.region}>
+                  <SelectLabel>{g.region}</SelectLabel>
+                  {g.zones.map(z => (
+                    <SelectItem key={z} value={z}>{z}</SelectItem>
+                  ))}
+                </SelectGroup>
+              ))}
+            </SelectContent>
+          </Select>
+          {preview && (
+            <div className="field-hint">
+              Station clock: <span className="mono-num">{preview}</span> in {localeLabel}. If that doesn’t match your watch, pick your zone above.
+            </div>
+          )}
+          <div className="field-hint">
+            Drives everything the DJ derives from the clock: time-of-day moods, schedule slots,
+            hourly time checks, festival dates. Applies live. Hourly archive filenames still follow
+            the server’s TZ.
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Localization" sub="Language variant and clock display">
+        <div className="field">
+          <Label>Station locale</Label>
+          <Select
+            value={form.locale}
+            onValueChange={val =>
+              setForm(f => ({ ...f, locale: normalizeStationLocale(val) }))
+            }
+          >
+            <SelectTrigger className="w-[260px] max-w-full" aria-label="Station locale"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="en-GB">English (UK), 24-hour</SelectItem>
+                <SelectItem value="en-US">English (US), AM/PM</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <div className="field-hint">
+            Sets station-facing display language and clock style. US English uses AM/PM for visible clock times. Applies live.
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Privacy" sub="Keep the station off the open web — one password, two locks">
+        <div className="grid gap-3">
+          <div className="field">
+            <Label>Private player</Label>
+            <Seg
+              options={[...ON_OFF]}
+              value={form.privacy.privatePlayer ? 'on' : 'off'}
+              onChange={id =>
+                setForm(f => ({ ...f, privacy: { ...f.privacy, privatePlayer: id === 'on' } }))
+              }
+            />
+            <div className="field-hint">
+              On: <code>/</code> and <code>/listen</code> ask for the station password
+              before showing the player. Hides the interface only — the now-playing
+              JSON stays public, so pair it with the stream password to actually gate
+              the audio. Applies live.
+            </div>
+          </div>
+
+          <div className="field">
+            <div className="flex items-center gap-2">
+              <Label>Stream password</Label>
+              {form.privacy.listenerAuth !== authOnFile && (
+                <Pill tone="ink">restart required</Pill>
+              )}
+            </div>
+            <Seg
+              options={[...ON_OFF]}
+              value={form.privacy.listenerAuth ? 'on' : 'off'}
+              onChange={id =>
+                setForm(f => ({ ...f, privacy: { ...f.privacy, listenerAuth: id === 'on' } }))
+              }
+            />
+            <div className="field-hint">
+              Icecast checks every listener connect against the controller, on every
+              mount. Turning this on or off needs a mixer restart (Broadcast & mixer) to
+              re-render the Icecast config; password changes apply live. While it&apos;s
+              on, the tune-in files (<code>/listen.pls</code>, <code>/listen.m3u</code>)
+              are disabled, and if the controller is down new listeners can&apos;t
+              connect (already-tuned listeners keep playing).
+            </div>
+          </div>
+
+          <div className="field">
+            <Label>Station password</Label>
+            <Input
+              type="password"
+              autoComplete="new-password"
+              value={form.privacy.password === 'set' ? '' : form.privacy.password}
+              placeholder={passwordOnFile ? '••••••••  (saved)' : 'shared station password'}
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setForm(f => ({ ...f, privacy: { ...f.privacy, password: e.target.value } }))
+              }
+              className="w-[320px] max-w-full"
+            />
+            <div className="field-hint break-words">
+              One password for everyone, used by both locks above (Icecast is
+              basic-auth only, so there are no per-user accounts). The web player asks
+              for it once and remembers it. Radio apps, VLC, Sonos and the native app
+              tune in with <code>https://listener:PASSWORD@your-station/stream.mp3</code>
+              {' '}— or append <code>?auth=PASSWORD</code> where userinfo isn&apos;t
+              supported. No whitespace; max 128 chars. Required before either lock can
+              be turned on.
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      <Advanced note="request rate limits and the public-API switch">
+      <Card title="Listener requests" sub="Rate limits and the pause switch for POST /request">
+        <div className="grid gap-3">
+          <div className="field">
+            <Label>Accept requests</Label>
+            <Seg
+              options={[...ON_OFF]}
+              value={form.requests.enabled ? 'on' : 'off'}
+              onChange={id =>
+                setForm(f => ({ ...f, requests: { ...f.requests, enabled: id === 'on' } }))
+              }
+            />
+            <div className="field-hint">
+              Off closes the request line instantly, no restart needed — the fast way to shut
+              requests down mid-raid. During the incident that prompted this page, the only
+              switch was an env var that needed a restart to flip; this applies live. Track picks
+              and everything else keep playing either way.
+            </div>
+          </div>
+
+          <div className="field">
+            <Label>Max queued requests</Label>
+            <Input
+              className="mono-num w-28"
+              aria-label="Max queued requests"
+              type="number"
+              min={1}
+              max={50}
+              step={1}
+              value={form.requests.maxPending}
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setForm(f => ({ ...f, requests: { ...f.requests, maxPending: e.target.value } }))
+              }
+            />
+            <div className="field-hint">
+              How many requested tracks may sit queued ahead of the auto-picker at once,
+              regardless of who asked. Clamped 1&ndash;50.
+            </div>
+          </div>
+
+          <div className="field">
+            <Label>Seconds between requests</Label>
+            <Input
+              className="mono-num w-28"
+              aria-label="Seconds between requests"
+              type="number"
+              min={5}
+              max={600}
+              step={1}
+              value={form.requests.cooldownSec}
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setForm(f => ({ ...f, requests: { ...f.requests, cooldownSec: e.target.value } }))
+              }
+            />
+            <div className="field-hint">
+              Minimum gap enforced between any two requests, station-wide — the basic anti-spam
+              throttle. Clamped 5&ndash;600s.
+            </div>
+          </div>
+
+          <div className="field">
+            <Label>Per-listener hourly cap</Label>
+            <Input
+              className="mono-num w-28"
+              aria-label="Per-listener hourly cap"
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={form.requests.perIpHourlyCap}
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setForm(f => ({ ...f, requests: { ...f.requests, perIpHourlyCap: e.target.value } }))
+              }
+            />
+            <div className="field-hint">
+              Requests any one IP address may make per hour. Clamped 1&ndash;100.
+            </div>
+          </div>
+
+          <div className="field">
+            <Label>Station hourly cap</Label>
+            <Input
+              className="mono-num w-28"
+              aria-label="Station hourly cap"
+              type="number"
+              min={5}
+              max={500}
+              step={1}
+              value={form.requests.globalHourlyCap}
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setForm(f => ({ ...f, requests: { ...f.requests, globalHourlyCap: e.target.value } }))
+              }
+            />
+            <div className="field-hint">
+              Requests the whole station accepts per hour, summed across every listener.
+              Clamped 5&ndash;500.
+            </div>
+          </div>
+
+          <div className="field">
+            <Label>Repeat cooldown (min, 0 = off)</Label>
+            <Input
+              className="mono-num w-28"
+              aria-label="Repeat cooldown in minutes"
+              type="number"
+              min={0}
+              max={1440}
+              step={1}
+              value={form.requests.repeatCooldownMin}
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setForm(f => ({ ...f, requests: { ...f.requests, repeatCooldownMin: e.target.value } }))
+              }
+            />
+            <div className="field-hint">
+              Blocks the same track being requested again until this many minutes have passed.
+              0 turns the check off. Clamped 0&ndash;1440.
+            </div>
+          </div>
+
+          <div className="field">
+            <Label>One request per listener at a time</Label>
+            <Seg
+              options={[...ON_OFF]}
+              value={form.requests.onePendingPerIp ? 'on' : 'off'}
+              onChange={id =>
+                setForm(f => ({ ...f, requests: { ...f.requests, onePendingPerIp: id === 'on' } }))
+              }
+            />
+            <div className="field-hint">
+              On: an IP can&apos;t queue a second request until its first one has played. Stops
+              one listener from stacking the whole queue with requests of their own.
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Public API" sub="What the unauthenticated reads hand out">
+        <div className="field">
+          <Label>Publish persona souls</Label>
+          <Seg
+            options={[...ON_OFF]}
+            value={form.privacy.publishPersonaSouls ? 'on' : 'off'}
+            onChange={id =>
+              setForm(f => ({ ...f, privacy: { ...f.privacy, publishPersonaSouls: id === 'on' } }))
+            }
+          />
+          <div className="field-hint">
+            On: <code>/schedule</code> and <code>/personas</code> include every
+            persona&apos;s soul, so an external site can render the whole roster with
+            bios in one request. Off (the default) publishes names, taglines and
+            avatars only. A soul is the persona&apos;s system prompt rather than a
+            written bio, so leave this off if yours carry private direction — the
+            tagline is the field meant for public display. Either way{' '}
+            <code>/dj</code> keeps publishing the on-air persona&apos;s soul, as it
+            always has. Applies live.
+          </div>
+        </div>
+      </Card>
+      </Advanced>
+
+      <SaveBar
+        note="Station name, location, timezone, locale, the private player, listener-request limits, and the public-API toggle apply live. Turning the stream password on or off needs a mixer restart."
+        busy={busy}
+        onSave={save}
+        saveLabel="Save station settings"
+        errors={fieldErrors}
+        ownedKeys={['station', 'stationDescription', 'timezone', 'locale', 'weather', 'privacy', 'requests']}
+      />
+    </>
+  );
+}

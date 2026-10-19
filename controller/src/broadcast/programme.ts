@@ -1,0 +1,507 @@
+import { prepareEpisodeContext, preparationSkillAt, showPreparation } from './show-preparation.js';
+import { skillEligible } from '../skills/eligibility.js';
+// Keep episode plans and aired beats on the session. Mark beats before generation to avoid
+// duplicate playback after failure. Inject the queue to avoid an import cycle.
+
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { config } from '../config.js';
+import * as settings from '../settings.js';
+import * as session from './session.js';
+import type { SessionContext } from './session.js';
+import type { QueueApi } from './queue.js';
+import * as dj from '../llm/dj.js';
+import { runCapability, skillCatalog } from '../skills/_agent.js';
+import { djCallsAllowed } from './listeners.js';
+import { autoVoiceAllowed } from './voice-policy.js';
+import { optionalSegmentsAllowed } from './dj-budget.js';
+import { withTrace, logEvent } from '../observability/events.js';
+import { zonedParts } from '../time.js';
+import { takeoverShowId } from '../schemas/schedule.js';
+import { HANDOVER_OFFSET_STEP_MINUTES } from '../schemas/settings.js';
+import { handoverOffsetMinutes } from './handover-policy.js';
+import { nextShowBoundaryMs } from './show-boundary.js';
+
+// How long after the intro aired the generic hourly time-check stays
+// suppressed: the intro owns the top of the show's first hour (#310).
+const INTRO_SUPPRESSES_HOURLY_MS = 45 * 60 * 1000;
+
+// Pure arc helpers, re-exported for callers.
+import { showSpan, overrideSpan, planFeature, beatWindow } from './programme-pure.js';
+export { showSpan, overrideSpan, planFeature, beatWindow };
+
+// The episode's position/length at `now`. A live SHOW takeover (#930) IS the
+// episode — the pinned show usually isn't in the grid at these hours, so
+// showSpan can't see it. Otherwise the grid run.
+function episodeSpan(now: Date): { index: number; total: number } {
+  const ov = settings.getScheduleOverride(now.getTime());
+  if (ov && takeoverShowId(ov)) return overrideSpan(ov, now.getTime());
+  const { dow, hour } = zonedParts(now);
+  return showSpan(settings.get().schedule, dow, hour);
+}
+
+// The beat due at this moment on the STATION clock. The outro's placement comes
+// through the policy module, never read from settings here.
+export function dueBeat(now = new Date()): 'feature' | 'outro' | null {
+  return beatWindow(zonedParts(now).minute, handoverOffsetMinutes(), HANDOVER_OFFSET_STEP_MINUTES);
+}
+
+// The active programme show, but only once the session has rolled into it —
+// beats must never fire against the previous session's state, so this keys off
+// session identity, not the wall clock alone.
+function activeEpisode(now = new Date()) {
+  const show = settings.resolveActiveShow(now);
+  if (!show?.programme) return null;
+  const sess = session.getSession();
+  if (!sess || sess.key !== `show:${show.id}`) return null;
+  return { show, sess };
+}
+
+// scheduler.skillsTick stands down on this so the generic segment director
+// doesn't compete with the planned beats.
+export function onAir(now = new Date()): boolean {
+  return !!activeEpisode(now);
+}
+
+// The programme intro owns the top of the show's first hour: pending means it
+// is about to air this tick, a recent stamp means it just did.
+export function suppressHourly(now = new Date()): boolean {
+  const ep = activeEpisode(now);
+  const prog = ep && session.getProgramme();
+  if (!prog) return false;
+  if (!prog.beats?.intro) return true;
+  return !!(prog.introAiredAt && now.getTime() - new Date(prog.introAiredAt).getTime() < INTRO_SUPPRESSES_HOURLY_MS);
+}
+
+// The most recent archived episode's angle for this show, so today's producer
+// takes a different line. Best-effort; any miss is null.
+async function previousAngle(showId: string): Promise<string | null> {
+  try {
+    const files = (await readdir(config.session.dir)).filter(f => f.endsWith('.json'));
+    const stamped = await Promise.all(files.map(async f => {
+      try { return { f, t: (await stat(`${config.session.dir}/${f}`)).mtimeMs }; } catch { return null; }
+    }));
+    const newest = stamped
+      .filter((x): x is { f: string; t: number } => Boolean(x))
+      .sort((a, b) => b.t - a.t)
+      .slice(0, 12);
+    for (const entry of newest) {
+      try {
+        const s = JSON.parse(await readFile(`${config.session.dir}/${entry.f}`, 'utf8'));
+        if (s?.show?.id === showId && s?.programme?.plan?.angle) return String(s.programme.plan.angle);
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+// The capability menu the producer may build features from: enabled, ready,
+// owned by the host persona, and co-hosted skills only when the episode has
+// guests. A kind the beat cannot run plans an hour that falls to straight talk.
+export function featureKindMenu(host: { skills?: string[] } | null | undefined, hasCohosts: boolean, preparationSkill: string | null = null): { kind: string; desc: string }[] {
+  try {
+    return skillCatalog()
+      .filter((c) => c.enabled && c.ready)
+      .filter((c) => !host?.skills || host.skills.includes(c.name))
+      .filter((c) => skillEligible({ seeded: false, skill: c.name, enabled: { [c.name]: true }, personaSkills: host?.skills, requiresCohosts: c.cohosts, hasCohosts, preparationSkill }).allowed)
+      .map((c) => ({ kind: c.kind, desc: c.description || c.label }));
+  } catch {
+    return [];
+  }
+}
+
+// Attach episode state and generate its plan idempotently. Voice/budget gates leave it
+// pending; generation failure selects fallback. Default now to the context time so look-ahead
+// does not compare against the outgoing show.
+interface PlanDeps {
+  generateProgrammePlan?: typeof dj.generateProgrammePlan;
+}
+
+type ProgrammeShow = NonNullable<ReturnType<typeof settings.resolveActiveShow>>;
+
+function programmeIsOwned(prog: session.ProgrammeState): boolean {
+  return session.getProgramme() === prog || session.getBoundaryProgramme() === prog;
+}
+
+async function fillPlan(
+  show: ProgrammeShow,
+  ctx: SessionContext,
+  now: Date,
+  prog: session.ProgrammeState,
+  attach: (next: session.ProgrammeState) => void,
+  { generateProgrammePlan = dj.generateProgrammePlan }: PlanDeps = {},
+): Promise<void> {
+  ctx = await prepareEpisodeContext(ctx);
+  if (!programmeIsOwned(prog)) return;
+  const occurrence = showPreparation.occurrence({ context: ctx });
+  if (occurrence) {
+    if (!prog.preparationOccurrence) {
+      const retained = session.unexpiredProgrammeEpisodes(prog, now.getTime());
+      const resumed = retained.find(episode => episode.preparationOccurrence?.id === occurrence.id);
+      if (resumed) {
+        prog = { ...resumed, interruptedEpisodes: retained.filter(episode => episode !== resumed) };
+        attach(prog);
+      }
+    }
+    const owner = session.getSession();
+    const inferred = !prog.preparationOccurrence && owner?.key === `show:${show.id}`
+      ? showPreparation.occurrence({ context: { ...ctx, at: owner.ctxAt ?? owner.startedAt } })
+      : null;
+    const legacy = inferred?.showId === show.id ? inferred : null;
+    if (legacy && session.getProgramme() === prog) session.rememberOpeningOccurrence({ id: legacy.id, endsAt: legacy.endsAt });
+    const previous = prog.preparationOccurrence ?? legacy
+      ?? (occurrence.source === 'takeover' ? { id: 'legacy', endsAt: 0 } : null);
+    const stampChanged = !prog.preparationOccurrence || previous?.id !== occurrence.id
+      || prog.preparationOccurrence.endsAt !== occurrence.endsAt;
+    if (previous && previous.id !== occurrence.id) {
+      const retained = session.unexpiredProgrammeEpisodes({ ...prog,
+        preparationOccurrence: { id: previous.id, endsAt: previous.endsAt } }, now.getTime());
+      const resumed = retained.find(episode => episode.preparationOccurrence?.id === occurrence.id);
+      prog = {
+        ...(resumed ?? { status: 'pending', plan: null, beats: {}, introAiredAt: null }),
+        interruptedEpisodes: retained.filter(episode => episode !== resumed),
+      };
+    }
+    prog.preparationOccurrence = { id: occurrence.id, endsAt: occurrence.endsAt };
+    if (stampChanged) attach(prog);
+  }
+  const preparation = showPreparation.read({ context: ctx }).status;
+  const subject = ctx.episodeEditorial && preparation.kind !== 'unconfigured' ? preparation.subject || '' : '';
+  if ((prog.preparationSubject || '') !== subject) {
+    prog.preparationSubject = subject;
+    prog.status = 'pending';
+    prog.plan = null;
+    attach(prog);
+  }
+  if (prog.status !== 'pending') return;
+  if (!autoVoiceAllowed()) return;  // station voice is off — no beat will air, so don't buy a plan
+  if (!optionalSegmentsAllowed()) return;  // over budget — stay pending, retry later
+
+  const span = episodeSpan(now);
+  // Span is measured from the show's FIRST hour; the plan covers what's left.
+  const hoursLeft = Math.max(1, span.total - span.index);
+  const roster = settings.getOnAirRoster(now);
+  const pinned = String(show.segmentSkill || '').trim() || null;
+  const prevAngle = await previousAngle(show.id);
+  try {
+    const plan = await withTrace({ kind: 'programme-plan', show: show.name }, () =>
+      generateProgrammePlan({
+        show,
+        spanHours: hoursLeft,
+        host: roster.host,
+        guests: roster.guests,
+        context: ctx,
+        previousAngle: prevAngle,
+        skillKinds: pinned ? [] : featureKindMenu(roster.host, roster.guests.length > 0, preparationSkillAt(ctx)),
+        pinnedKind: pinned,
+      }));
+    // A cap keeps the same object, including in-flight work. A later airing
+    // owns a new object: a delayed producer must not replace its plan/beats.
+    if (!programmeIsOwned(prog)) return;
+    prog.status = 'ok';
+    prog.plan = plan;
+    attach(prog);
+    logEvent('programme.plan', { show: show.name, angle: plan?.angle || null });
+  } catch (err) {
+    if (!programmeIsOwned(prog)) return;
+    prog.status = 'fallback';
+    attach(prog);
+    logEvent('programme.plan', { show: show.name, error: (err as Error).message });
+  }
+}
+
+export async function ensurePlan(
+  ctx: SessionContext,
+  now = session.contextDate(ctx),
+  deps: PlanDeps = {},
+): Promise<void> {
+  const ep = activeEpisode(now);
+  if (!ep) return;
+  let prog = session.getProgramme();
+  if (!prog) {
+    prog = { status: 'pending', plan: null, beats: {}, introAiredAt: null };
+    session.attachProgramme(prog);
+  }
+  await fillPlan(ep.show, ctx, now, prog, session.attachProgramme, deps);
+}
+
+// Build the incoming episode while the final outgoing track is still live.
+// The state rides the boundary handoff and transfers on the real session roll;
+// attaching it to the current session would make the outgoing show inherit the
+// incoming programme before the boundary.
+export async function prepareBoundaryPlan(
+  ctx: SessionContext,
+  deps: PlanDeps = {},
+): Promise<void> {
+  const pending = session.pendingHandoff();
+  if (!pending || !('incomingPersonaId' in pending)) return;
+  const now = session.contextDate(ctx);
+  const show = settings.resolveActiveShow(now);
+  if (!show?.programme || pending.targetKey !== `show:${show.id}`) return;
+  let prog = session.getBoundaryProgramme();
+  if (!prog) {
+    prog = { status: 'pending', plan: null, beats: {}, introAiredAt: null };
+    session.attachBoundaryProgramme(prog);
+  }
+  await fillPlan(show, ctx, now, prog, next => {
+    // It may have transferred from the boundary to the live session while the
+    // producer was awaiting the model. Persist through its current owner.
+    if (session.getProgramme() === prog || session.getProgramme() === next) session.attachProgramme(next);
+    else session.attachBoundaryProgramme(next);
+  }, deps);
+}
+
+// Intro — the top of the show. Fires from the same call sites as the persona
+// handoff, AFTER runPersonaHandoff: when the boundary also changed personas the
+// mic-pass already opened the show, so the standalone intro is skipped and just
+// marked. Returns true when a standalone intro aired now.
+export async function maybeRunIntro(
+  queue: QueueApi,
+  ctx: SessionContext,
+  now = session.contextDate(ctx),
+  _options: { opportunity?: boolean } = {},
+): Promise<boolean> {
+  const ep = activeEpisode(now);
+  const prog = ep && session.getProgramme();
+  if (!prog || prog.beats?.intro) return false;
+
+  // A persona handoff at this boundary already opened the show on air.
+  const handoffOpenedOccurrence = !prog.preparationOccurrence || !ep.sess.episodeOccurrenceId
+    || prog.preparationOccurrence.id === ep.sess.episodeOccurrenceId;
+  if (handoffOpenedOccurrence && ((ep.sess.rolledFrom && ep.sess.handoffAired)
+      || ep.sess.boundaryHandoff?.targetKey === ep.sess.key)) {
+    markIntroAired();
+    return false;
+  }
+  // The mic-pass is still pending for this boundary and doubles as the intro;
+  // airing the standalone intro now would duck mid-song and introduce the
+  // episode twice. Stays pending — the boundary tick re-runs this after
+  // runPersonaHandoff.
+  if (session.pendingHandoff()) return false;
+  // Voice off / over budget / quiet: stays pending and unmarked, so the intro
+  // can still open the remaining hours if the gate reopens.
+  if (!autoVoiceAllowed()) return false;
+  if (!djCallsAllowed() || !optionalSegmentsAllowed()) return false;  // stays pending — may air later this hour
+  markIntroAired();
+  await runIntro(queue, ctx, now, { automaticHostSpeech: true });
+  return true;
+}
+
+// Mark the intro beat + stamp its air time (suppressHourly keys off the stamp).
+// One helper so the autonomous and manual paths agree — a manual intro must
+// also stand the generic hourly check down.
+export function markIntroAired() {
+  const prog = session.getProgramme();
+  if (!prog) return;
+  session.markProgrammeBeat('intro');
+  prog.introAiredAt = new Date().toISOString();
+  session.attachProgramme(prog);
+}
+
+// Gate-free intro core — also the manual /dj/segment runner (via scheduler's
+// wrapper, which re-marks the beat so the autonomous path never repeats it).
+export async function runIntro(queue: QueueApi, ctx: SessionContext, now = new Date(), { automaticHostSpeech = false }: { automaticHostSpeech?: boolean } = {}): Promise<string> {
+  ctx = await prepareEpisodeContext(ctx);
+  const show = settings.resolveActiveShow(now);
+  if (!show?.programme) throw new Error('no programme show is on air');
+  const prog = session.getProgramme();
+  const plan = prog?.plan || null;
+  return withTrace({ kind: 'programme-intro', show: show.name }, async () => {
+    const roster = settings.getOnAirRoster(now);
+    const common = {
+      show, plan, context: ctx,
+      recap: queue.getDjRecap(), recentOpeners: queue.getRecentOpeners(),
+    };
+    if (roster.guests.length && roster.host) {
+      try {
+        const lines = await dj.generateProgrammeExchange({ beat: 'intro', host: roster.host, guests: roster.guests, ...common });
+        if (lines && await queue.announceExchange(lines, 'programme-intro', { castNames: [roster.host, ...roster.guests].map(p => p.name) })) {
+          return lines.map((l: { persona: { name: string }; text: string }) => `${l.persona.name}: ${l.text}`).join('\n');
+        }
+      } catch (err) {
+        queue.log('error', `Programme intro exchange failed, falling back solo: ${(err as Error).message}`);
+      }
+    }
+    const soloHost = settings.getOnAirRoster(now).host;
+    const speechOwner = automaticHostSpeech
+      ? session.captureAutomaticHostSpeech(soloHost, now)
+      : { persona: soloHost, hostSpeech: null };
+    const script = await dj.generateProgrammeIntro({ persona: speechOwner.persona, ...common });
+    await queue.announce(script, 'programme-intro', {
+      persona: speechOwner.persona,
+      meta: { personaId: speechOwner.persona?.id, personaName: speechOwner.persona?.name },
+      hostSpeech: speechOwner.hostSpeech,
+    });
+    return script;
+  });
+}
+
+// Feature — the planned mid-hour segment. Cron-driven at :35 each show hour.
+export async function featureTick(queue: QueueApi, ctx: SessionContext, now = new Date()): Promise<void> {
+  const ep = activeEpisode(now);
+  const prog = ep && session.getProgramme();
+  if (!prog) return;
+  const span = episodeSpan(now);
+  const beat = `feature:${span.index}`;
+  if (prog.beats?.[beat]) return;
+  if (!autoVoiceAllowed()) return;  // station voice is off (manual /dj/segment still runs the beat)
+  if (!djCallsAllowed() || !optionalSegmentsAllowed()) return;
+  await ensurePlan(ctx, now);  // late plan (budget freed up mid-show) still helps
+  session.markProgrammeBeat(beat);
+  try {
+    await runFeature(queue, ctx, { hourIndex: span.index, now, automaticHostSpeech: true });
+  } catch (err) {
+    queue.log('error', `Programme feature failed: ${(err as Error).message}`);
+  }
+}
+
+// Gate-free feature core. Resolution order: the show's pinned segmentSkill,
+// else the plan's kind for this hour, both through the forced segment director
+// with the feature topic as the brief. Any miss falls to the straight-talk
+// floor so the beat still airs.
+export async function runFeature(queue: QueueApi, ctx: SessionContext, { hourIndex = null, now = new Date(), automaticHostSpeech = false }: { hourIndex?: number | null; now?: Date; automaticHostSpeech?: boolean } = {}): Promise<string> {
+  ctx = await prepareEpisodeContext(ctx);
+  const show = settings.resolveActiveShow(now);
+  if (!show?.programme) throw new Error('no programme show is on air');
+  const prog = session.getProgramme();
+  const plan = prog?.plan || null;
+  const idx = hourIndex ?? episodeSpan(now).index;
+  const feature = planFeature(plan, idx);
+  const topic = feature?.topic || show.topic || `the heart of "${show.name}"`;
+  const pinned = String(show.segmentSkill || '').trim() || null;
+  let kind = pinned || feature?.kind || null;
+  // A producer-chosen kind is re-checked against the menu the producer is
+  // offered (featureKindMenu: enabled, ready, host-owned, cohost-eligible), at
+  // air time: the plan lives in session.json for the whole episode, so a skill
+  // the operator disabled mid-show must not still air at the next feature beat.
+  // The show's own pinned segmentSkill is the operator's choice and is not
+  // second-guessed here.
+  if (kind && !pinned) {
+    const roster = settings.getOnAirRoster(now);
+    const menu = featureKindMenu(roster.host, roster.guests.length > 0, preparationSkillAt(ctx));
+    if (!menu.some((k) => k.kind === kind)) {
+      queue.log('scheduler', `Programme feature capability "${kind}" is not on this show's capability menu (disabled, not ready, or not the host's) — airing straight talk instead`);
+      kind = null;
+    }
+  }
+
+  return withTrace({ kind: 'programme-feature', show: show.name, capability: kind || 'talk' }, async () => {
+    let speaker = settings.pickOnAirSpeaker(now);
+    const reserved = automaticHostSpeech && kind === preparationSkillAt(ctx);
+    if (kind && !reserved) {
+      try {
+        const run = await runCapability(kind, ctx, {
+          brief: `This segment is the planned feature of the programme "${show.name}". Today's feature: ${topic}${plan?.angle ? ` (episode angle: ${plan.angle})` : ''}. Build the segment around it.`,
+          persona: speaker,
+          // Programme beats keep their established ducked/boundary placement;
+          // pause-and-talk is for director/skill segments, not the feature arc.
+          pauseTalkEligible: false,
+          automaticHostSpeech,
+        });
+        if (run.queued && run.text) return run.text;
+        // Skill stood down for want of usable data (#1412). The beat is still
+        // mandatory, so fall through to the straight-talk floor.
+        queue.log('scheduler', `Programme feature capability "${kind}" stood down (${run.reason || 'no usable data'}) — airing straight talk instead`);
+      } catch (err) {
+        queue.log('error', `Programme feature capability "${kind}" failed (${(err as Error).message}) — airing straight talk instead`);
+      }
+    }
+    const speechOwner = automaticHostSpeech
+      ? session.captureAutomaticHostSpeech(speaker, now)
+      : { persona: speaker, hostSpeech: null };
+    speaker = speechOwner.persona;
+    const script = await dj.generateProgrammeFeature({
+      show, topic, plan, persona: speaker, context: ctx,
+      recap: queue.getDjRecap(), recentOpeners: queue.getRecentOpeners(),
+    });
+    await queue.announce(script, 'programme-feature', {
+      persona: speaker,
+      meta: { personaId: speaker?.id, personaName: speaker?.name },
+      hostSpeech: speechOwner.hostSpeech,
+    });
+    return script;
+  });
+}
+
+// Outro — the sign-off. Driven by the talk table's programme row in the show's
+// FINAL hour, `handover.offsetMinutes` before the boundary (:55 by default).
+export async function outroTick(queue: QueueApi, ctx: SessionContext, now = new Date()): Promise<void> {
+  const ep = activeEpisode(now);
+  const prog = ep && session.getProgramme();
+  if (!prog || prog.beats?.outro) return;
+  const span = episodeSpan(now);
+  if (span.index !== span.total - 1) return;  // not the final hour yet
+  // A persona-changing show boundary has its own final-track sign-off and
+  // greeting. Do not also say goodbye at the configurable programme-outro
+  // minute: that is the upstream spacer model this branch replaces.
+  const boundaryAt = nextShowBoundaryMs(now.getTime(), 2 * 3600);
+  const outgoingId = session.getSession()?.persona?.id ?? null;
+  const incomingId = boundaryAt == null
+    ? null
+    : settings.getEffectivePersona(new Date(boundaryAt))?.id ?? null;
+  if (outgoingId && incomingId && outgoingId !== incomingId) return;
+  if (!autoVoiceAllowed()) return;  // station voice is off (manual /dj/segment still runs the beat)
+  if (!djCallsAllowed() || !optionalSegmentsAllowed()) return;
+  session.markProgrammeBeat('outro');
+  try {
+    await runOutro(queue, ctx, now, { automaticHostSpeech: true });
+  } catch (err) {
+    queue.log('error', `Programme outro failed: ${(err as Error).message}`);
+  }
+}
+
+// Gate-free outro core.
+export async function runOutro(queue: QueueApi, ctx: SessionContext, now = new Date(), { automaticHostSpeech = false }: { automaticHostSpeech?: boolean } = {}): Promise<string> {
+  ctx = await prepareEpisodeContext(ctx);
+  const show = settings.resolveActiveShow(now);
+  if (!show?.programme) throw new Error('no programme show is on air');
+  const prog = session.getProgramme();
+  const plan = prog?.plan || null;
+  // Tease whatever the grid says follows this show, if anything.
+  const next = settings.resolveActiveShow(new Date(now.getTime() + 60 * 60 * 1000));
+  const nextShowName = next && next.id !== show.id ? next.name : null;
+  return withTrace({ kind: 'programme-outro', show: show.name }, async () => {
+    const roster = settings.getOnAirRoster(now);
+    const common = {
+      show, plan, context: ctx, nextShowName,
+      recap: queue.getDjRecap(), recentOpeners: queue.getRecentOpeners(),
+    };
+    if (roster.guests.length && roster.host) {
+      try {
+        const lines = await dj.generateProgrammeExchange({ beat: 'outro', host: roster.host, guests: roster.guests, ...common });
+        if (lines && await queue.announceExchange(lines, 'programme-outro', { castNames: [roster.host, ...roster.guests].map(p => p.name) })) {
+          return lines.map((l: { persona: { name: string }; text: string }) => `${l.persona.name}: ${l.text}`).join('\n');
+        }
+      } catch (err) {
+        queue.log('error', `Programme outro exchange failed, falling back solo: ${(err as Error).message}`);
+      }
+    }
+    const soloHost = settings.getOnAirRoster(now).host;
+    const speechOwner = automaticHostSpeech
+      ? session.captureAutomaticHostSpeech(soloHost, now)
+      : { persona: soloHost, hostSpeech: null };
+    const script = await dj.generateProgrammeOutro({ persona: speechOwner.persona, ...common });
+    await queue.announce(script, 'programme-outro', {
+      persona: speechOwner.persona,
+      meta: { personaId: speechOwner.persona?.id, personaName: speechOwner.persona?.name },
+      hostSpeech: speechOwner.hostSpeech,
+    });
+    return script;
+  });
+}
+
+// The one call both maybeRoll call sites make after runPersonaHandoff: attach +
+// plan the episode, then air the intro if still pending. Returns true when a
+// standalone intro aired. `now` follows ensurePlan's contextDate rule.
+//
+// `opportunity` passes through to maybeRunIntro (#1576) and has no default
+// here on purpose: a new call site must state whether it is a handover moment.
+export async function onSessionSettled(
+  queue: QueueApi,
+  ctx: SessionContext,
+  now = session.contextDate(ctx),
+  _options: { opportunity: boolean },
+): Promise<boolean> {
+  if (!activeEpisode(now)) return false;
+  await ensurePlan(ctx, now);
+  return maybeRunIntro(queue, ctx, now);
+}

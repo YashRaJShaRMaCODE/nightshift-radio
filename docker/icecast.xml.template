@@ -1,0 +1,87 @@
+<icecast>
+    <location>Wolverhampton, UK</location>
+    <admin>parm@homelab</admin>
+
+    <limits>
+        <clients>${ICECAST_MAX_CLIENTS}</clients>
+        <sources>4</sources>
+        <!-- queue-size: per-client backlog before Icecast drops a lagging
+             listener. 4x burst-size (floored at 2 MB) — it must comfortably
+             exceed the burst or a client is evicted the moment it falls
+             behind its own primed buffer (issue #993). -->
+        <queue-size>${ICECAST_QUEUE_SIZE}</queue-size>
+        <client-timeout>30</client-timeout>
+        <header-timeout>15</header-timeout>
+        <source-timeout>10</source-timeout>
+        <burst-on-connect>1</burst-on-connect>
+        <!-- burst-size: audio bursted on connect to prime the client's buffer
+             (issue #993). Delivered at line speed, so tune-in stays instant;
+             the cost is listening that far behind the live edge, which is why
+             /now-playing publishes stream.bufferSeconds and players shift
+             their displays by it (issue #1114).
+
+             Both values are computed by broadcast-entrypoint.sh from
+             settings.stream.bufferSeconds x bitrate, never hardcoded — they
+             are byte counts, so a fixed value drifts badly across bitrates.
+             These <limits> are sized for MP3 and act as the default; every
+             stream mount below carries its own burst/queue. -->
+        <burst-size>${ICECAST_BURST_SIZE}</burst-size>
+    </limits>
+
+    <authentication>
+        <source-password>${ICECAST_SOURCE_PASSWORD}</source-password>
+        <relay-password>${ICECAST_RELAY_PASSWORD}</relay-password>
+        <admin-user>admin</admin-user>
+        <admin-password>${ICECAST_ADMIN_PASSWORD}</admin-password>
+    </authentication>
+
+    <hostname>localhost</hostname>
+
+    <listen-socket>
+        <port>7702</port>
+    </listen-socket>
+
+    <fileserve>1</fileserve>
+
+    <!-- The entrypoint replaces the marker with one <mount> block per stream
+         mount, each with its own burst/queue sized from bufferSeconds x THAT
+         mount's bitrate (the global <limits> above only fit MP3). Under
+         listener auth (#478) each block also carries <authentication
+         type="url"> pointing at the controller's POST /listener-auth. -->
+    <!--@STREAM_MOUNTS@-->
+
+
+    <paths>
+        <basedir>/usr/share/icecast2</basedir>
+        <logdir>/var/log/icecast2</logdir>
+        <webroot>/usr/share/icecast2/web</webroot>
+        <adminroot>/usr/share/icecast2/admin</adminroot>
+        <pidfile>/var/run/icecast2/icecast.pid</pidfile>
+        <alias source="/" destination="/status.xsl"/>
+
+        <!-- The entrypoint replaces the marker with one <x-forwarded-for>
+             element per trusted proxy IP; without one, every listener shows as
+             the proxy's container IP. Two icecast-KH quirks (verified on
+             2.4.0-kh22): the value must be an EXACT IP — a CIDR is accepted
+             and then silently never matches — and the LEFT-MOST entry of the
+             X-Forwarded-For chain wins (the original client, correct even
+             though Caddy appends its own peer). -->
+        <!--@TRUSTED_PROXIES@-->
+    </paths>
+
+    <logging>
+        <accesslog>access.log</accesslog>
+        <errorlog>error.log</errorlog>
+        <loglevel>3</loglevel>
+        <logsize>10000</logsize>
+    </logging>
+
+    <security>
+        <chroot>0</chroot>
+    </security>
+
+    <http-headers>
+        <header name="Access-Control-Allow-Origin" value="*" />
+        <header name="Access-Control-Allow-Headers" value="Origin, Range, Accept-Encoding, Referer" />
+    </http-headers>
+</icecast>

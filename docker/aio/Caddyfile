@@ -1,0 +1,58 @@
+# Caddy edge for the all-in-one image (docker/Dockerfile.aio). Same route
+# table as the split-stack docker/Caddyfile, but every backend is loopback in
+# this same container. No Cloudflare trusted_proxies block — the AIO is aimed
+# at LAN / behind whatever proxy the operator already runs.
+{
+	auto_https off
+}
+
+:80 {
+	# Icecast mounts. Opus/FLAC/AAC are off by default but must be listed or
+	# they fall through to the catch-all and 404. flush_interval -1 keeps the
+	# never-ending audio body live.
+	@streams path /stream.mp3 /stream.opus /stream.flac /stream.aac
+	handle @streams {
+		reverse_proxy 127.0.0.1:7702 {
+			flush_interval -1
+			transport http {
+				read_buffer 16KB
+				response_header_timeout 30s
+				dial_timeout 5s
+			}
+		}
+	}
+
+	# Icecast's URL-auth callback — NOT reachable from the internet (password
+	# oracle otherwise; icecast calls the controller on loopback directly).
+	# A prefix so a trailing slash is denied too. Kept in lockstep with
+	# docker/Caddyfile.
+	handle /api/listener-auth* {
+		respond 404
+	}
+
+	# Controller REST API (prefix stripped so its routes stay at root).
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:7701
+	}
+
+	# One-paste tune-in files — served by the controller at its root (NOT under
+	# /api), so plain handle, no path stripping.
+	@listen path /listen.pls /listen.m3u
+	handle @listen {
+		reverse_proxy 127.0.0.1:7701
+	}
+
+	# Everything else → Next.js web UI.
+	handle {
+		reverse_proxy 127.0.0.1:7700
+	}
+
+	# Don't gzip the already-compressed live audio mounts.
+	@compressible not path /stream.mp3 /stream.opus /stream.flac /stream.aac
+	encode @compressible gzip zstd
+
+	log {
+		output stdout
+		format console
+	}
+}

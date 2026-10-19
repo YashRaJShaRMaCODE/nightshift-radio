@@ -1,0 +1,81 @@
+// The on-air seed is excluded from tool results and cannot be the next pick (#1247).
+// Share this wording across pick/request schemas and empty-result rules.
+export const SEED_NOT_A_PICK_CLAUSE =
+  'The track already playing is only the SEED you pass to the discovery tools — its id is never a valid answer, even when a tool comes back empty.';
+
+export type PickFailureKind = 'no-candidates' | 'no-discovery' | 'seed-echo' | 'unknown-id';
+
+export interface PickFailure {
+  kind: PickFailureKind;
+  // Operator-facing booth-log cause. No trailing "falling back to pool" — the
+  // call site adds that.
+  message: string;
+  // Only true when the failure is evidence the model can't drive the tool-loop
+  // harness. A run with an observed empty candidate set remains breaker-exempt.
+  countsAgainstBreaker: boolean;
+}
+
+export function classifyPickFailure(
+  { pickedId, seedId, candidates, toolCalls, shortlist }:
+  {
+    pickedId: string | null; seedId: string | null; candidates: number; toolCalls: number;
+    // Present on the Track Shortlist route, where the controller runs the
+    // sources and an empty list means no model was asked at all. `returned` is
+    // what the sources handed back before the show's filters.
+    shortlist?: { returned: number };
+  },
+): PickFailure {
+  const echoed = !!pickedId && !!seedId && pickedId === seedId;
+
+  // The Shortlist runs its own sources, so neither agent message fits: there
+  // was no answer to mismatch and no model failing to call tools. Name what
+  // actually emptied the list, so a thin show reads as a library question.
+  if (shortlist && candidates === 0) {
+    return {
+      kind: 'no-candidates',
+      message: shortlist.returned > 0
+        ? `Track Shortlist had nothing to choose from: ${toolCalls} source run(s) returned ${shortlist.returned} track(s) and none passed this show's filters (genre/era locks, track length, recent plays, blocklist), so no model was asked`
+        : `Track Shortlist had nothing to choose from: ${toolCalls} source run(s) returned no tracks for this show, so no model was asked`,
+      countsAgainstBreaker: false,
+    };
+  }
+
+  // `toolCalls` counts real discovery calls (the synthetic `done` is excluded),
+  // so zero means the model never explored: a harness failure, not a coverage
+  // one, and it must count against the breaker.
+  if (candidates === 0 && toolCalls === 0) {
+    return {
+      kind: 'no-discovery',
+      message: 'agent made no discovery call at all, so its answer could not come from any tool — the configured model may not drive tool calls',
+      countsAgainstBreaker: true,
+    };
+  }
+
+  // Zero candidates after real discovery: both salvage stages need a non-empty
+  // `seen`, so the run cannot produce a validated pick (#1247).
+  if (candidates === 0) {
+    return {
+      kind: 'no-candidates',
+      message: echoed
+        ? 'agent had no candidates available for selection; it returned the discovery seed id. Check the discovery/recovery trace; an empty candidate set alone does not establish missing index coverage'
+        : 'agent had no candidates available for selection; its answer did not match a discovered candidate. Check the discovery/recovery trace; an empty candidate set alone does not establish missing index coverage',
+      countsAgainstBreaker: false,
+    };
+  }
+
+  // Candidates existed, the model still answered with the seed, and the
+  // constrained re-pick missed too: a harness problem.
+  if (echoed) {
+    return {
+      kind: 'seed-echo',
+      message: `agent answered with the on-air track's own id despite ${candidates} candidate(s) from its own tools, and the corrective re-pick missed`,
+      countsAgainstBreaker: true,
+    };
+  }
+
+  return {
+    kind: 'unknown-id',
+    message: `agent returned unknown id ${pickedId ?? 'none'} (${candidates} candidate(s) surfaced, near-miss repair and corrective re-pick both missed)`,
+    countsAgainstBreaker: true,
+  };
+}

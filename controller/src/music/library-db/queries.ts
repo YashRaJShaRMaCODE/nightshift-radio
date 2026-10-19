@@ -1,0 +1,334 @@
+import { z } from 'zod';
+import { parseVocalRangesJson } from '../lyric-vocal.js';
+import { preparationTrackSchema } from '../../schemas/show-preparation.js';
+import { getTrack } from './tracks.js';
+// Mood- and tag-keyed reads, plus the per-genre embedding centroids.
+
+import { SQL_HAS_MOODS, SQL_NO_MOODS, requireDb } from './handle.js';
+import type { EnergyValue, MoodPoolRecord, MoodPoolRow, EnergyPoolRecord, EnergyPoolRow } from './types.js';
+import { rowToMoodPool, rowToEnergyPool, safeParseArray } from './rows.js';
+
+// Projected to exactly the fields blocklist-rules.ruleMatches reads. Not
+// rowToTrack: GET /library/blocklist runs this over the whole library per request.
+export function ruleMatchRows(): Array<{
+  id: string;
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  genres: string[] | null;
+  genre: string | null;
+  moods: string[] | null;
+  audioMoods: string[] | null;
+  lastfmTags: string[] | null;
+}> {
+  const rows = requireDb()
+    .prepare(`SELECT id, title, artist, album, genres, genre, moods, audio_moods, lastfm_tags FROM tracks`)
+    .all() as Array<Record<string, any>>;
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title ?? null,
+    artist: r.artist ?? null,
+    album: r.album ?? null,
+    genres: r.genres ? safeParseArray(r.genres) : null,
+    genre: r.genre ?? null,
+    moods: r.moods ? safeParseArray(r.moods) : null,
+    audioMoods: r.audio_moods ? safeParseArray(r.audio_moods) : null,
+    lastfmTags: r.lastfm_tags ? safeParseArray(r.lastfm_tags) : null,
+  }));
+}
+
+const MOOD_POOL_COLUMNS = `t.id, t.title, t.artist, t.album, t.album_id, t.artist_id,
+  t.year, t.genres, t.genre, t.moods, t.energy, t.duration_sec`;
+
+export function songsByMood(mood: string): MoodPoolRecord[] {
+  // Start at the covering membership index, never scan tracks/json_each.
+  // Sorting by rowid preserves the former full-scan bucket order.
+  const rows = requireDb().prepare(`SELECT ${MOOD_POOL_COLUMNS}
+    FROM track_moods m JOIN tracks t ON t.id = m.track_id
+    WHERE m.mood = ? ORDER BY t.rowid`).all(mood) as MoodPoolRow[];
+  return rows.map(rowToMoodPool);
+}
+
+export function songsByEnergy(energy: EnergyValue): EnergyPoolRecord[] {
+  if (!energy) return [];
+  const rows = requireDb().prepare(`SELECT ${MOOD_POOL_COLUMNS},
+    t.original_year, t.is_compilation, t.era_untrusted, t.audio_moods,
+    t.bpm, t.musical_key, t.intro_ms, t.loudness_lufs,
+    t.structure_json, t.vocal_ranges_json, t.pace_json
+    FROM tracks t WHERE t.energy = ? AND ${SQL_HAS_MOODS} ORDER BY t.rowid`).all(energy) as EnergyPoolRow[];
+  return rows.map(rowToEnergyPool);
+}
+
+export function allTaggedIds(): string[] {
+  return (
+    requireDb()
+      .prepare(`SELECT id FROM tracks WHERE ${SQL_HAS_MOODS}`)
+      .all() as Array<{ id: string }>
+  ).map(r => r.id);
+}
+
+// Ids of one energy bucket, in table order (the same order songsByEnergy uses).
+export function idsByEnergy(energy: EnergyValue): string[] {
+  if (!energy) return [];
+  // Same population as songsByEnergy (tagged rows only, #1732): the ids-only
+  // read must not widen the bucket it replaces on the pick path.
+  return (requireDb().prepare(`SELECT id FROM tracks WHERE energy = ? AND ${SQL_HAS_MOODS} ORDER BY rowid`).all(energy) as Array<{ id: string }>)
+    .map((r) => r.id);
+}
+
+// Trusted sample for the propagation self-check: no 'propagated' rows (circular)
+// and no vectorless rows (KNN can't run). Null source = legacy LLM import, counts.
+export function trustedTaggedIds(): string[] {
+  return (
+    requireDb()
+      .prepare(
+        `SELECT id FROM tracks
+          WHERE ${SQL_HAS_MOODS}
+            AND (source IS NULL OR source != 'propagated')
+            AND id IN (SELECT id FROM track_vectors)
+          ORDER BY id`,
+      )
+      .all() as Array<{ id: string }>
+  ).map(r => r.id);
+}
+
+// Rows whose prompt_hash or model differs from the current ones (NULL counts
+// stale), for "Re-decide moods". Never source='manual': operator tags are ground
+// truth. `IS NOT ?` is null-safe inequality.
+export function staleTaggedIds(promptHash: string, model: string, limit?: number): string[] {
+  const sql =
+    `SELECT id FROM tracks
+       WHERE ${SQL_HAS_MOODS}
+         AND (source IS NULL OR source != 'manual')
+         AND (prompt_hash IS NOT ? OR model IS NOT ?)
+       ORDER BY id` + (limit && limit > 0 ? ` LIMIT ${Math.floor(limit)}` : '');
+  const rows = requireDb().prepare(sql).all(promptHash, model) as Array<{ id: string }>;
+  return rows.map(r => r.id);
+}
+
+// "Re-enrich" scope: only what was already enriched. Distinct from --re-enrich,
+// which spans the full live catalogue (#531).
+export function enrichedIds(): string[] {
+  return (
+    requireDb()
+      .prepare('SELECT id FROM tracks WHERE enriched_at IS NOT NULL')
+      .all() as Array<{ id: string }>
+  ).map(r => r.id);
+}
+
+export function untaggedIds(limit?: number): string[] {
+  const q = limit
+    ? `SELECT id FROM tracks WHERE ${SQL_NO_MOODS} LIMIT ?`
+    : `SELECT id FROM tracks WHERE ${SQL_NO_MOODS}`;
+  const stmt = requireDb().prepare(q);
+  const rows = (limit ? stmt.all(limit) : stmt.all()) as Array<{ id: string }>;
+  return rows.map(r => r.id);
+}
+
+export function unembeddedIds(limit?: number): string[] {
+  const q = limit
+    ? `SELECT t.id FROM tracks t LEFT JOIN track_vectors v ON v.id = t.id WHERE v.id IS NULL LIMIT ?`
+    : `SELECT t.id FROM tracks t LEFT JOIN track_vectors v ON v.id = t.id WHERE v.id IS NULL`;
+  const stmt = requireDb().prepare(q);
+  const rows = (limit ? stmt.all(limit) : stmt.all()) as Array<{ id: string }>;
+  return rows.map(r => r.id);
+}
+
+// "Re-embed" scope. Capture BEFORE dropVectors(), after which every track looks
+// unembedded, then rebuild exactly these.
+export function embeddedIds(): string[] {
+  return (
+    requireDb()
+      .prepare('SELECT id FROM track_vectors')
+      .all() as Array<{ id: string }>
+  ).map(r => r.id);
+}
+
+// Buckets untagged tracks by (genre, decade) so seed-selector can stratify. The
+// CASE is the SQL twin of era-year.resolveEraYear.
+export function trackIdsByGenreDecade(): Map<string, string[]> {
+  const rows = requireDb()
+    .prepare(
+      `SELECT id, COALESCE(genre, '') AS g,
+              CASE
+                WHEN original_year > 0 THEN (original_year / 10) * 10
+                WHEN is_compilation = 1 OR era_untrusted = 1 THEN 0
+                WHEN year > 0 THEN (year / 10) * 10
+                ELSE 0
+              END AS decade
+       FROM tracks WHERE ${SQL_NO_MOODS}`,
+    )
+    .all() as Array<{ id: string; g: string; decade: number }>;
+  const out = new Map<string, string[]>();
+  for (const r of rows) {
+    const key = `${r.g}|${r.decade}`;
+    const list = out.get(key) ?? [];
+    list.push(r.id);
+    out.set(key, list);
+  }
+  return out;
+}
+
+// Mean text vector per genre, for music/genre-suggest.ts. Streamed with running
+// sums so the library is never held at once.
+export interface GenreCentroid {
+  genre: string;
+  count: number;
+  centroid: Float32Array;
+}
+
+export interface GenreVectorSums {
+  dim: number;
+  sums: Map<string, { sum: Float64Array; count: number }>;
+}
+
+// Below every rowid SQLite assigns on its own.
+export const GENRE_WALK_START = Number.MIN_SAFE_INTEGER;
+
+// json_each: a track contributes to every genre it carries, not just the primary.
+// Rowid order is what lets a walk stop and resume. The rowid range must drive
+// the outer loop: if the planner sorted instead, the first step of every slice
+// would read the whole library (#1976).
+const GENRE_VECTORS_SQL = `SELECT t.rowid AS rid, je.value AS genre, v.embedding AS embedding
+       FROM tracks t
+       JOIN track_vectors v ON v.id = t.id, json_each(t.genres) je
+      WHERE t.rowid > ? AND je.value IS NOT NULL AND TRIM(je.value) != ''
+      ORDER BY t.rowid`;
+
+export function newGenreVectorSums(): GenreVectorSums {
+  return { dim: 0, sums: new Map() };
+}
+
+// One slice of the centroid walk: adds tracks after `afterRowid`, in rowid
+// order, until `budgetMs` has passed. It stops on a track boundary so no track
+// is half-counted, and closes its statement before returning, so the caller can
+// yield the event loop between slices. At 150k tracks the whole walk is
+// seconds, which in one call stalls every other request (#1976). Returns the
+// rowid to resume after, or null once the library is exhausted.
+export function addGenreVectors(acc: GenreVectorSums, afterRowid: number, budgetMs = Infinity): number | null {
+  const stmt = requireDb().prepare(GENRE_VECTORS_SQL);
+  const deadline = performance.now() + budgetMs;
+  let cut: number | null = null;
+  for (const row of stmt.iterate(afterRowid) as Iterable<{ rid: number; genre: string; embedding: Buffer }>) {
+    if (cut !== null && row.rid !== cut) return cut;
+    const b = row.embedding;
+    const vec = new Float32Array(b.buffer, b.byteOffset, Math.floor(b.byteLength / 4));
+    if (!acc.dim) acc.dim = vec.length;
+    if (vec.length === acc.dim) { // defensive: skip any stray off-dim rows
+      let sum = acc.sums.get(row.genre);
+      if (!sum) {
+        sum = { sum: new Float64Array(acc.dim), count: 0 };
+        acc.sums.set(row.genre, sum);
+      }
+      for (let i = 0; i < acc.dim; i++) sum.sum[i] += vec[i];
+      sum.count++;
+    }
+    if (cut === null && performance.now() >= deadline) cut = row.rid;
+  }
+  return null;
+}
+
+export function centroidsOf(acc: GenreVectorSums): GenreCentroid[] {
+  const out: GenreCentroid[] = [];
+  for (const [genre, { sum, count }] of acc.sums) {
+    if (!count) continue;
+    const centroid = new Float32Array(acc.dim);
+    for (let i = 0; i < acc.dim; i++) centroid[i] = sum[i] / count;
+    out.push({ genre, count, centroid });
+  }
+  return out;
+}
+
+// The whole walk in one call. The request path uses genre-suggest.ts's sliced walk.
+export function genreCentroids(): GenreCentroid[] {
+  const acc = newGenreVectorSums();
+  addGenreVectors(acc, GENRE_WALK_START);
+  return centroidsOf(acc);
+}
+// Whole-library projection for the Show-editor candidate diagnostic: the fields
+// the strict show locks use, none of the heavy analysis JSON.
+export function candidateFilterTracks(): Array<{
+  id: string;
+  title: string | null;
+  artist: string | null;
+  year: number | null;
+  originalYear: number | null;
+  isCompilation: boolean | null;
+  yearUntrusted: boolean | null;
+  genres: string[];
+  genre: string | null;
+  moods: string[];
+  audioMoods: string[];
+  energy: EnergyValue;
+  vocalRanges: unknown[] | null;
+  vocalRangesInvalid: boolean;
+  // For the minimum-track-length floor (#1573); without this column every row
+  // reads as unknown length and the funnel over-counts.
+  durationSec: number | null;
+}> {
+  type CandidateFilterRow = {
+    id: string;
+    title: string | null;
+    artist: string | null;
+    year: number | null;
+    original_year: number | null;
+    is_compilation: number | null;
+    era_untrusted: number | null;
+    genres: string | null;
+    genre: string | null;
+    moods: string | null;
+    audio_moods: string | null;
+    energy: EnergyValue;
+    vocal_ranges_json: string | null;
+    duration_sec: number | null;
+  };
+  const rows = requireDb().prepare(`SELECT id, title, artist, year, original_year,
+    is_compilation, era_untrusted, genres, genre, moods, audio_moods, energy, duration_sec,
+    vocal_ranges_json
+    FROM tracks`).all() as CandidateFilterRow[];
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title ?? null,
+    artist: row.artist ?? null,
+    year: row.year ?? null,
+    originalYear: row.original_year ?? null,
+    isCompilation: row.is_compilation == null ? null : !!row.is_compilation,
+    yearUntrusted: (row.is_compilation === 1 || row.era_untrusted === 1)
+      ? true
+      : (row.is_compilation == null && row.era_untrusted == null ? null : false),
+    genres: row.genres ? safeParseArray(row.genres) : [],
+    genre: row.genre ?? null,
+    moods: row.moods ? safeParseArray(row.moods) : [],
+    audioMoods: row.audio_moods ? safeParseArray(row.audio_moods) : [],
+    energy: row.energy ?? null,
+    ...parseVocalRangesJson(row.vocal_ranges_json),
+    durationSec: row.duration_sec ?? null,
+  }));
+}
+
+export function tracksByArtistId(artistId: string) {
+  const ids = z.array(z.object({ id: z.string() })).parse(requireDb().prepare('SELECT id FROM tracks WHERE artist_id = ?').all(artistId));
+  return ids.flatMap(({ id }) => {
+    const track = getTrack(id);
+    if (!track) return [];
+    const parsed = preparationTrackSchema.safeParse(track);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
+export function artistIdentities(minTracks: number) {
+  return z.array(z.object({ id: z.string(), name: z.string() })).parse(requireDb().prepare(`
+    SELECT artist_id AS id, MIN(artist) AS name FROM tracks
+    WHERE artist_id IS NOT NULL AND artist IS NOT NULL
+    GROUP BY artist_id HAVING COUNT(DISTINCT LOWER(COALESCE(title, id)) || '|' || LOWER(artist)) >= ?
+  `).all(minTracks));
+}
+
+// Every distinct artist credit in the library, for the spacing guards' act
+// index (library.knownActKeys). Credits only; no row data.
+export function distinctArtistCredits(): string[] {
+  const rows = requireDb().prepare(
+    `SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL AND artist != ''`,
+  ).all() as Array<{ artist: string }>;
+  return rows.map(r => r.artist);
+}

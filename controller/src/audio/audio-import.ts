@@ -1,0 +1,148 @@
+// ffmpeg validates and normalizes uploads to WAV jingles or MP3 effects.
+// Without ffmpeg, preserve raw bytes and their original extension for previews.
+
+import { spawn } from 'node:child_process';
+import { writeFile, mkdir, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+// Container/codec formats Liquidsoap can decode and we accept on import.
+export const ACCEPTED_AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'oga', 'flac', 'm4a', 'aac', 'opus'] as const;
+
+const CONTENT_TYPES: Record<string, string> = {
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  flac: 'audio/flac',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+};
+
+// Lower-cased extension without the dot, or '' if there isn't one.
+export function extOf(name: string): string {
+  const ext = path.extname(String(name || '')).slice(1).toLowerCase();
+  return ext;
+}
+
+// Filename minus its extension — used as a default jingle label.
+export function baseName(name: string): string {
+  return path.basename(String(name || ''), path.extname(String(name || ''))).trim();
+}
+
+export function isAcceptedAudio(name: string): boolean {
+  return (ACCEPTED_AUDIO_EXTS as readonly string[]).includes(extOf(name));
+}
+
+// Content type for an audio file path, defaulting to a safe generic.
+export function audioContentType(filePath: string): string {
+  return CONTENT_TYPES[extOf(filePath)] || 'application/octet-stream';
+}
+
+// Cached ffmpeg-availability probe. `null` until first checked.
+let ffmpegOk: boolean | null = null;
+
+export async function hasFfmpeg(): Promise<boolean> {
+  if (ffmpegOk !== null) return ffmpegOk;
+  ffmpegOk = await new Promise<boolean>((resolve) => {
+    try {
+      const proc = spawn('ffmpeg', ['-version']);
+      proc.on('error', () => resolve(false));
+      proc.on('close', (code) => resolve(code === 0));
+    } catch {
+      resolve(false);
+    }
+  });
+  return ffmpegOk;
+}
+
+// Duration in seconds via ffprobe; null when ffprobe is missing or the file
+// can't be probed. Callers treat unknown length as acceptable, never a failure.
+export function probeDurationSec(filePath: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn('ffprobe', [
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        filePath,
+      ]);
+      let out = '';
+      proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.on('error', () => resolve(null));
+      proc.on('close', (code) => {
+        const n = parseFloat(out.trim());
+        resolve(code === 0 && Number.isFinite(n) && n > 0 ? Math.round(n * 10) / 10 : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+type TranscodeFormat = 'wav' | 'mp3';
+
+// ffmpeg's atempo filter only accepts 0.5–2.0 per instance; factors outside
+// that range are reached by chaining instances (e.g. 4.0 → atempo=2.0,atempo=2.0).
+export function atempoChain(factor: number): string {
+  const steps: string[] = [];
+  let f = factor;
+  while (f > 2.0) { steps.push('atempo=2.0'); f /= 2.0; }
+  while (f < 0.5) { steps.push('atempo=0.5'); f /= 0.5; }
+  steps.push(`atempo=${f.toFixed(4)}`);
+  return steps.join(',');
+}
+
+function runFfmpeg(args: string[]): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const proc = spawn('ffmpeg', args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg failed (exit ${code}): ${stderr.trim().slice(-300)}`));
+    });
+  });
+}
+
+// Transcode an in-memory upload to outPath. The input goes to a temp file (not
+// piped) so seek-dependent containers like m4a/mp4 decode correctly. `loudnorm`
+// is EBU R128 levelling, on for speech-length jingles and off for short
+// transient effects where one-pass loudnorm under 2s is unreliable.
+// `sampleRate`/`channels` pin the output shape. With loudnorm, set sampleRate:
+// its dynamic mode upsamples to 192 kHz, including the output unless -ar is set.
+export async function transcodeAudio(
+  input: Buffer,
+  { outPath, format, loudnorm = false, atempo, sampleRate, channels }: {
+    outPath: string;
+    format: TranscodeFormat;
+    loudnorm?: boolean;
+    atempo?: number;
+    sampleRate?: number;
+    channels?: number;
+  },
+): Promise<void> {
+  if (!input?.length) throw new Error('empty audio buffer');
+  await mkdir(path.dirname(outPath), { recursive: true });
+
+  const tmp = path.join(tmpdir(), `subwave-import-${crypto.randomBytes(6).toString('hex')}`);
+  await writeFile(tmp, input);
+  try {
+    const args = ['-hide_banner', '-loglevel', 'error', '-i', tmp];
+    const filters: string[] = [];
+    if (loudnorm) filters.push('loudnorm=I=-16:TP=-1.5:LRA=11');
+    if (atempo && Number.isFinite(atempo) && atempo > 0 && atempo !== 1.0) filters.push(atempoChain(atempo));
+    if (filters.length) args.push('-af', filters.join(','));
+    if (format === 'wav') args.push('-c:a', 'pcm_s16le');
+    else args.push('-c:a', 'libmp3lame', '-q:a', '4');
+    if (sampleRate) args.push('-ar', String(sampleRate));
+    if (channels) args.push('-ac', String(channels));
+    args.push('-y', outPath);
+    await runFfmpeg(args);
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}

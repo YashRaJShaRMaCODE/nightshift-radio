@@ -1,0 +1,127 @@
+export function fmtTime(sec: number | null | undefined): string {
+  if (sec == null || !Number.isFinite(sec)) return '–:––';
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, '0')}`;
+}
+
+export type StationLocale = 'en-GB' | 'en-US';
+
+const DEFAULT_STATION_LOCALE: StationLocale = 'en-GB';
+
+export function normalizeStationLocale(locale: unknown): StationLocale {
+  return locale === 'en-US' ? 'en-US' : DEFAULT_STATION_LOCALE;
+}
+
+function stationClockOptions(locale: StationLocale): Intl.DateTimeFormatOptions {
+  return locale === 'en-US' ? { hour12: true } : { hour12: false };
+}
+
+// Rendered in the STATION's zone. The DJ speaks the time in the configured
+// station timezone, so log/booth stamps must match or a viewer in another
+// timezone sees stamps that disagree with what the DJ just said (issue #418).
+// `tz` is the IANA zone from /now-playing | /state | /debug, falling back to
+// the browser's local zone. Returns '' for a missing timestamp.
+export function fmtClock(
+  t: string | number | null | undefined,
+  tz?: string | null,
+  locale?: StationLocale | null,
+): string {
+  if (t == null) return '';
+  const stationLocale = normalizeStationLocale(locale);
+  try {
+    return new Date(t).toLocaleTimeString(stationLocale, {
+      ...stationClockOptions(stationLocale),
+      ...(tz ? { timeZone: tz } : {}),
+    });
+  } catch {
+    return String(t);
+  }
+}
+
+export function fmtClockMinute(
+  t: string | number | Date,
+  tz?: string | null,
+  locale?: StationLocale | null,
+): string {
+  const stationLocale = normalizeStationLocale(locale);
+  try {
+    return new Date(t).toLocaleTimeString(stationLocale, {
+      hour: '2-digit',
+      minute: '2-digit',
+      ...stationClockOptions(stationLocale),
+      ...(tz ? { timeZone: tz } : {}),
+    });
+  } catch {
+    return '';
+  }
+}
+
+// Compact station date + time for the admin header, e.g. "Fri 2 Oct · 14:37:45".
+// The weekday stays even in this compact form: the show schedule is weekly, so
+// the day is what tells an operator which programming is due. The clock follows
+// the station's timezone and 12h/24h convention.
+export function fmtStationDateTime(
+  t: string | number | Date,
+  tz?: string | null,
+  locale?: StationLocale | null,
+): string {
+  try {
+    const date = new Date(t);
+    // Built from parts, not .format(): ICU versions disagree on the
+    // punctuation between the weekday and the date ("Thu 24 Sep" vs
+    // "Thu, 24 Sep"), and the header should read the same in every browser.
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      ...(tz ? { timeZone: tz } : {}),
+    }).formatToParts(date);
+    const part = (type: Intl.DateTimeFormatPartTypes) =>
+      parts.find((p) => p.type === type)?.value ?? '';
+    const datePart = `${part('weekday')} ${part('day')} ${part('month')}`;
+    return `${datePart} · ${fmtClock(date.getTime(), tz, locale)}`;
+  } catch {
+    return '';
+  }
+}
+
+const DOW: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+// Day-of-week (0=Sun) and hour (0-23) for `date` on the wall clock in `tz`.
+// Mirrors the controller's zonedParts so the schedule grid's "now" marker lands
+// on the same cell the controller resolves the active show from; otherwise the
+// highlight follows the operator's browser zone, not the station's (#418).
+export function zonedDayHour(date: Date, tz?: string | null): { dow: number; hour: number } {
+  if (!tz) return { dow: date.getDay(), hour: date.getHours() };
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: tz,
+      weekday: 'short',
+      hour: 'numeric',
+      hour12: false,
+    }).formatToParts(date);
+    const out: Record<string, string> = {};
+    for (const p of parts) out[p.type] = p.value;
+    // en-GB with hour12:false can render midnight as "24".
+    return { dow: DOW[out.weekday ?? ''] ?? date.getDay(), hour: Number(out.hour) % 24 };
+  } catch {
+    return { dow: date.getDay(), hour: date.getHours() };
+  }
+}
+
+export function relTime(t: string | number | Date): string {
+  const diff = (Date.now() - new Date(t).getTime()) / 1000;
+  if (diff < 60) return `${Math.max(1, Math.floor(diff))}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  return `${Math.floor(diff / 86400)}d`;
+}
+
+export function fmtSize(n: number | null | undefined): string {
+  if (n == null) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}

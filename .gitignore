@@ -1,0 +1,58 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Node
+# No trailing slash: also catches a stray file/symlink named node_modules
+# (a broken macOS-local symlink slipped past the dir-only pattern in #325).
+node_modules
+
+# Python bytecode (running scripts/vocal_gate_test.py compiles analyze_worker)
+__pycache__/
+
+# Next.js
+.next/
+out/
+
+# TypeScript
+web/tsconfig.tsbuildinfo
+controller/tsconfig.tsbuildinfo
+cli/tsconfig.tsbuildinfo
+
+# Compiled CLI binaries (produced by `npm --prefix cli run build:all`).
+# Distributed via the publish-cli GitHub workflow as release assets.
+cli/dist/
+
+# Runtime state — file-based IPC, TTS output, archives, logs
+state/
+
+# Claude Code worktrees + local runtime files
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+tmp/
+
+# Source screenshots — originals kept local; site uses web/public/screenshots/*.webp
+docs/screenshots/
+
+# Local host-specific compose overrides (CPU caps, etc.)
+docker-compose.override.yml
+scripts/.fx-render/
+
+# llm-bench reports (local benchmark artifacts)
+controller/scripts/llm-bench/reports/
+
+# design-sync (machine state — the durable set in .design-sync/ IS committed)
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
+web/.ds-styles.css
+__pycache__/

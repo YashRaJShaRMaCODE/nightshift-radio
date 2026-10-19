@@ -1,0 +1,305 @@
+// Short stingers the segment-director agent plays under its voice via the
+// sfx_queue. Files at <stateDir>/sfx/<name>.mp3, sidecar at <stateDir>/sfx.json
+// (name → { name, description, prompt, durationSec, file, builtin, createdAt }).
+// No .m3u unlike jingles: effects play on demand via sfx.txt, never rotate.
+
+import { readFile, writeFile, unlink, mkdir, stat, copyFile } from 'node:fs/promises';
+import { STATE_DIR, SOUNDS_DIR } from '../config.js';
+import { SFX_MAX_SEC } from '../schemas/imaging.js';
+import { generateSfx, isConfigured } from '../audio/sfx-gen.js';
+import { transcodeAudio, hasFfmpeg, extOf, isAcceptedAudio, probeDurationSec } from '../audio/audio-import.js';
+import { writeFileAtomic } from '../util/atomic-file.js';
+import { slugify } from '../util/slug.js';
+
+// Hard ceiling on any effect, generated or uploaded: Liquidsoap mixes these at
+// 0.7 gain with only a light duck, so a long clip drones on past the voice.
+// Held in the shared imaging schema so the admin form can't disagree with this.
+export const MAX_DURATION_SEC = SFX_MAX_SEC;
+
+const DIR = `${STATE_DIR}/sfx`;
+const META = `${STATE_DIR}/sfx.json`;
+// Repo-bundled defaults, copied in by ensureDefaults() so a fresh boot needs
+// no ElevenLabs key.
+const BUNDLE_DIR = `${SOUNDS_DIR}/sfx`;
+
+const DEFAULT_SFX = [
+  {
+    name: 'record-scratch',
+    description: 'abrupt vinyl record scratch — punctuates a hard cut, a joke, or a sudden change of subject',
+    prompt: 'abrupt vinyl record scratch, short and sharp',
+    durationSec: 1.5,
+  },
+  {
+    name: 'airhorn',
+    description: 'a single short airhorn blast — celebratory; use very sparingly, only for a genuinely big moment',
+    prompt: 'single short reggae airhorn blast',
+    durationSec: 1.5,
+  },
+  {
+    name: 'applause',
+    description: 'a brief burst of crowd applause — for a triumphant or warm beat',
+    prompt: 'short warm crowd applause burst',
+    durationSec: 2.5,
+  },
+  {
+    name: 'whoosh',
+    description: 'a quick transitional whoosh — smooths a scene change or a fast aside',
+    prompt: 'quick cinematic transition whoosh',
+    durationSec: 1.2,
+  },
+  {
+    name: 'drum-roll',
+    description: 'a short drum roll — builds anticipation before a reveal',
+    prompt: 'short snare drum roll ending on a cymbal hit',
+    durationSec: 2.5,
+  },
+  {
+    name: 'vinyl-stop',
+    description: 'a turntable power-down — a dramatic dead stop on a thought',
+    prompt: 'turntable power down, vinyl record slowing to a stop',
+    durationSec: 1.8,
+  },
+];
+
+async function loadMeta(): Promise<any> {
+  try {
+    return JSON.parse(await readFile(META, 'utf8'));
+  } catch {
+    return { items: {} };
+  }
+}
+
+async function saveMeta(meta: any) {
+  // Atomic: getPath can read this concurrently with an admin save.
+  await writeFileAtomic(META, JSON.stringify(meta, null, 2));
+}
+
+async function statOrNull(p: string) {
+  try { return await stat(p); } catch { return null; }
+}
+
+export async function list() {
+  const meta = await loadMeta();
+  const out: any[] = [];
+  for (const [name, info] of Object.entries(meta.items) as [string, any][]) {
+    const s = await statOrNull(`${DIR}/${info.file}`);
+    if (!s) continue;
+    out.push({
+      name,
+      description: info.description || '',
+      prompt: info.prompt || '',
+      durationSec: info.durationSec || null,
+      builtin: !!info.builtin,
+      source: info.source || (info.builtin ? 'builtin' : 'generated'),
+      createdAt: info.createdAt,
+      size: s.size,
+    });
+  }
+  out.sort((a: any, b: any) => {
+    if (a.builtin !== b.builtin) return a.builtin ? 1 : -1;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+  return out;
+}
+
+// The slim view the segment agent reads. Duration rides along so the prompt can
+// show how long a clip will sit under the voice.
+export async function catalog() {
+  return (await list()).map((s: any) => ({ name: s.name, description: s.description, durationSec: s.durationSec }));
+}
+
+export async function getPath(name: string) {
+  const meta = await loadMeta();
+  const info = meta.items[name];
+  if (!info) return null;
+  const filePath = `${DIR}/${info.file}`;
+  return (await statOrNull(filePath)) ? filePath : null;
+}
+
+export async function create({ name, description, prompt, durationSec, builtin = false }: any = {}) {
+  const slug = slugify(name);
+  if (!slug) throw new Error('Sound effect name is required');
+  if (!prompt || !prompt.trim()) throw new Error('Sound effect prompt is required');
+  const requestedSec = Number(durationSec) || null;
+  if (requestedSec && requestedSec > MAX_DURATION_SEC) {
+    throw new Error(`sound effects are capped at ${MAX_DURATION_SEC}s — shorter stingers sit better under the voice`);
+  }
+  await mkdir(DIR, { recursive: true });
+
+  // Same guard as importAudio: regenerating into an existing name would clobber
+  // its audio and flip a built-in to deletable (`builtin` defaults false here).
+  const meta = await loadMeta();
+  if (meta.items[slug]) throw new Error(`a sound effect named "${slug}" already exists`);
+
+  const file = `${slug}.mp3`;
+  await generateSfx(prompt, { durationSec: requestedSec ?? undefined, outPath: `${DIR}/${file}` });
+  // ElevenLabs picks its own length when none was requested; record the real one.
+  const measured = await probeDurationSec(`${DIR}/${file}`);
+
+  meta.items[slug] = {
+    name: slug,
+    description: (description || '').trim(),
+    prompt: prompt.trim(),
+    durationSec: measured ?? requestedSec,
+    file,
+    builtin,
+    createdAt: new Date().toISOString(),
+  };
+  await saveMeta(meta);
+  return meta.items[slug];
+}
+
+// Transcoded to MP3 when ffmpeg is available, otherwise stored as-is. No
+// loudnorm: a one-pass loudness pass on a short transient is unreliable and the
+// broadcast limiter catches peaks. Rejects an existing name.
+export async function importAudio(
+  buffer: Buffer,
+  { name, description = '', originalName = '' }: { name: string; description?: string; originalName?: string },
+) {
+  const slug = slugify(name);
+  if (!slug) throw new Error('Sound effect name is required');
+  if (!buffer?.length) throw new Error('Empty audio file');
+  if (originalName && !isAcceptedAudio(originalName)) {
+    throw new Error(`Unsupported audio type: ${originalName}`);
+  }
+  await mkdir(DIR, { recursive: true });
+
+  const meta = await loadMeta();
+  if (meta.items[slug]) throw new Error(`a sound effect named "${slug}" already exists`);
+
+  let file: string;
+  if (await hasFfmpeg()) {
+    file = `${slug}.mp3`;
+    await transcodeAudio(buffer, { outPath: `${DIR}/${file}`, format: 'mp3' });
+  } else {
+    file = `${slug}.${extOf(originalName) || 'mp3'}`;
+    await writeFile(`${DIR}/${file}`, buffer);
+  }
+
+  // Length gate. Unknown duration (no ffprobe) is accepted rather than blocking.
+  const measured = await probeDurationSec(`${DIR}/${file}`);
+  if (measured && measured > MAX_DURATION_SEC) {
+    await unlink(`${DIR}/${file}`).catch(() => {});
+    throw new Error(`"${originalName || slug}" is ${measured}s long — sound effects are capped at ${MAX_DURATION_SEC}s`);
+  }
+
+  meta.items[slug] = {
+    name: slug,
+    description: (description || '').trim(),
+    prompt: '',
+    durationSec: measured,
+    file,
+    builtin: false,
+    source: 'upload',
+    createdAt: new Date().toISOString(),
+  };
+  await saveMeta(meta);
+  return meta.items[slug];
+}
+
+export async function remove(name) {
+  const meta = await loadMeta();
+  const info = meta.items[name];
+  if (!info) throw new Error(`unknown sound effect: ${name}`);
+  if (info.builtin) throw new Error('cannot delete a built-in sound effect');
+
+  try { await unlink(`${DIR}/${info.file}`); } catch {}
+  delete meta.items[name];
+  await saveMeta(meta);
+  return { ok: true };
+}
+
+// Prefers the repo-bundled audio (a plain copy, no API call), falling back to
+// ElevenLabs generation only when no bundled file exists.
+async function installDefault(def, meta) {
+  const file = `${def.name}.mp3`;
+  const bundled = `${BUNDLE_DIR}/${file}`;
+
+  if (await statOrNull(bundled)) {
+    await copyFile(bundled, `${DIR}/${file}`);
+    console.log(`[sfx] installed bundled default effect → ${def.name}`);
+  } else if (isConfigured()) {
+    await generateSfx(def.prompt, { durationSec: def.durationSec, outPath: `${DIR}/${file}` });
+    console.log(`[sfx] generated default effect → ${def.name}`);
+  } else {
+    return false;
+  }
+
+  meta.items[def.name] = {
+    name: def.name,
+    description: (def.description || '').trim(),
+    prompt: (def.prompt || '').trim(),
+    durationSec: Number(def.durationSec) || null,
+    file,
+    builtin: true,
+    createdAt: new Date().toISOString(),
+  };
+  return true;
+}
+
+// Called from server.js startup; idempotent. With neither a bundled file nor a
+// key the library stays empty and the feature is invisible to the agent.
+export async function ensureDefaults() {
+  await mkdir(DIR, { recursive: true });
+  const meta = await loadMeta();
+  let installed = 0;
+  for (const def of DEFAULT_SFX) {
+    const existing = meta.items[def.name];
+    if (existing && (await statOrNull(`${DIR}/${existing.file}`))) continue;
+    try {
+      if (await installDefault(def, meta)) installed++;
+    } catch (err) {
+      console.error(`[sfx] default "${def.name}" install failed:`, err.message);
+    }
+  }
+  if (installed) await saveMeta(meta);
+  if (!Object.keys(meta.items).length) {
+    console.log('[sfx] no default sound effects available (no bundled files, no ElevenLabs key)');
+  }
+}
+
+// What a stored effect's `file` may be: `<slug>.<audio ext>`, the only shape
+// create/importAudio/installDefault ever write. getPath and remove join it onto
+// the sfx folder, so this is the check that keeps a sidecar row inside it.
+function isStoredFileName(file: unknown): file is string {
+  if (typeof file !== 'string') return false;
+  const dot = file.lastIndexOf('.');
+  if (dot <= 0) return false;
+  const stem = file.slice(0, dot);
+  return slugify(stem) === stem && isAcceptedAudio(file) && /^[a-z0-9]+$/i.test(file.slice(dot + 1));
+}
+
+/**
+ * Replace the sidecar with the one a station backup carried. Backs the restore
+ * in routes/backup.ts, which used to write sfx.json verbatim. Each row answers
+ * to the rules the writers above apply — the key is a slug, `file` is
+ * `<slug>.<audio ext>` — and a row that fails is dropped and named.
+ */
+export async function restoreMeta(raw: unknown): Promise<{ kept: number; dropped: string[] }> {
+  const items = (raw as any)?.items;
+  if (!items || typeof items !== 'object' || Array.isArray(items)) {
+    throw new Error('sfx.json is not a sound-effect sidecar');
+  }
+  const next: Record<string, any> = {};
+  const dropped: string[] = [];
+  for (const [name, info] of Object.entries(items as Record<string, any>)) {
+    if (!name || slugify(name) !== name || !info || typeof info !== 'object' || !isStoredFileName(info.file)) {
+      dropped.push(name);
+      continue;
+    }
+    const duration = Number(info.durationSec);
+    next[name] = {
+      name,
+      description: typeof info.description === 'string' ? info.description : '',
+      prompt: typeof info.prompt === 'string' ? info.prompt : '',
+      durationSec: Number.isFinite(duration) && duration > 0 ? duration : null,
+      file: info.file,
+      builtin: info.builtin === true,
+      ...(typeof info.source === 'string' ? { source: info.source } : {}),
+      ...(typeof info.createdAt === 'string' ? { createdAt: info.createdAt } : {}),
+    };
+  }
+  await mkdir(DIR, { recursive: true });
+  await saveMeta({ items: next });
+  return { kept: Object.keys(next).length, dropped };
+}

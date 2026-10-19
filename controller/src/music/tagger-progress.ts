@@ -1,0 +1,107 @@
+// Structured progress channel from the tagger/analyzer children: one sentinel
+// line per update on stdout, parsed by broadcast/tagger.ts into `tagger.progress`.
+// Dependency-free so both the CLI scripts and the server can import it.
+export const PROGRESS_PREFIX = '[progress] ';
+
+export type TaggerPhase =
+  | 'walk'
+  | 'enrich'
+  | 'embed'
+  | 'seed'
+  | 'propagate'
+  | 'learn'
+  | 'analyze'
+  | 'done';
+
+export interface TaggerProgress {
+  phase: TaggerPhase;
+  // Authored here so the UI needs no phase->label map.
+  label: string;
+  done?: number;
+  // Absent total = indeterminate (the Navidrome walk reports no count up front).
+  total?: number;
+  // Active-learning round (phase 'learn' only).
+  round?: number;
+  // Cumulative failures within the current phase.
+  errors?: number;
+  // Per-leg tagged counts when dual-LLM mode is draining the batch queue.
+  llm?: { legs: Record<string, number> };
+  // Cumulative wall-clock per phase in ms. Attached to the terminal 'done' event
+  // only; absent on in-flight events.
+  timings?: Record<string, number>;
+  updatedAt: string;
+}
+
+export function reportProgress(p: Omit<TaggerProgress, 'updatedAt'>): void {
+  console.log(PROGRESS_PREFIX + JSON.stringify({ ...p, updatedAt: new Date().toISOString() }));
+}
+
+// Second sentinel channel: discrete typed status events, so the panel renders by
+// kind instead of regex-scraping log lines (a song title containing "failed" used
+// to read as a failure).
+export const EVENT_PREFIX = '[event] ';
+
+export type TaggerEventKind = 'info' | 'success' | 'warning' | 'error';
+
+export interface TaggerEvent {
+  kind: TaggerEventKind;
+  // Operator-facing sentence, composed at the call site.
+  text: string;
+  at: string;
+}
+
+export function reportEvent(e: Omit<TaggerEvent, 'at'>): void {
+  console.log(EVENT_PREFIX + JSON.stringify({ ...e, at: new Date().toISOString() }));
+}
+
+// Adoption is phase 0 of a potentially long run. Tell the controller as soon
+// as the recovery map is durable so track blocks/likes/pins follow the new IDs.
+// The exit and boot hooks also replay it if this notification is lost.
+export const ROTATION_PREFIX = '[rotation] ';
+
+export interface TaggerRotation {
+  adopted: number;
+  at: string;
+}
+
+export function reportRotation(r: Omit<TaggerRotation, 'at'>): void {
+  console.log(ROTATION_PREFIX + JSON.stringify({ ...r, at: new Date().toISOString() }));
+}
+
+// A nonempty authoritative walk has finished adoption AND pruning. Consumers
+// may now rebuild without waiting for enrichment/tagging/analysis to finish.
+// Separate from [rotation], which can arrive before pruning and is only a
+// notification that the journal is durable.
+export const CATALOGUE_PREFIX = '[catalogue] ';
+
+export function reportCatalogueReady(walked: number): void {
+  console.log(CATALOGUE_PREFIX + JSON.stringify({ walked }));
+}
+
+// Bind an event logger to a module's console tag ('tag' / 'analyze'). Each call
+// emits BOTH the terse `[tag] …` line (docker logs stay greppable) AND the event
+// sentinel, so call sites stay one line. Both go to stdout back-to-back so the
+// capture side can drop the plain echo and keep only the structured entry.
+export function makeEventLogger(prefix: string) {
+  return (kind: TaggerEventKind, text: string): void => {
+    // Collapse newlines: a multi-line echo defeats the controller's de-dup.
+    const line = text.replace(/\s*\n\s*/g, ' ');
+    console.log(`[${prefix}] ${line}`);
+    reportEvent({ kind, text: line });
+  };
+}
+
+// Slowest-first, zero-duration phases dropped. Shared by the CLI breakdown line
+// and the 'done' event's `timings` so the two can't drift.
+export function sortedPhaseTimings(timings: Record<string, number>): Array<[string, number]> {
+  return Object.entries(timings)
+    .filter(([, ms]) => ms > 0)
+    .sort((a, b) => b[1] - a[1]);
+}
+
+// e.g. "seed 480s · learn 360s · embed 120s"; '' when nothing was timed.
+export function formatPhaseBreakdown(timings: Record<string, number>): string {
+  return sortedPhaseTimings(timings)
+    .map(([p, ms]) => `${p} ${Math.round(ms / 1000)}s`)
+    .join(' · ');
+}
