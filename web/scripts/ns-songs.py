@@ -1,25 +1,18 @@
 """Build web/lib/stationSongs.json for nightshift radio: mood stations of YouTube songs with real durations.
 
-  pip install playwright && playwright install chromium
   python scripts/ns-songs.py                 # rebuild every mood from MOODS below
   python scripts/ns-songs.py romantic <url>  # add a playlist / video to one mood, then rebuild
 
-Playlists are expanded in a real browser through the YouTube IFrame player (no API key). Each video's
+Playlists are read from their public pages (no API key). Each video's
 watch page is then read for its length and whether its owner allows embedding; blocked or short videos
 are dropped so the station never stalls on them.
 """
 import json
 import re
 import sys
-import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import tempfile
-
-from playwright.sync_api import sync_playwright
 
 OUT = Path(__file__).resolve().parent.parent / "lib" / "stationSongs.json"
 MOODS = {
@@ -36,15 +29,19 @@ MOODS = {
     "sufi": ["PL4ZJnEUgawnTFBopyqmkfdN4RHZl9elbf", "PLqMtStrmKvO9mqk_LTyBAtka8KMYMJbwg"],
     "drive": ["PLvWfwCPLBQ5-OfZBJFlqTd6yyJqn0wMDJ", "PLHvybnsTYyfX336Tn6Pych7U_uDuMNZIL"],
 }
-PAGE = """<!doctype html><body><script>
-const s = document.createElement('script'); s.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(s);
-window.ready = new Promise(r => window.onYouTubeIframeAPIReady = r);
-window.expand = list => ready.then(() => new Promise(res => { const d = document.createElement('div'); document.body.appendChild(d);
-  const p = new YT.Player(d, {width: 200, height: 200, playerVars: {listType: 'playlist', list}, events: {onReady: () => { let n = 0;
-    const t = setInterval(() => { const ids = p.getPlaylist() || []; if (ids.length || ++n > 50) { clearInterval(t); res(ids); p.destroy(); } }, 500); }}}); }));
-</script></body>"""
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126 Safari/537.36",
            "Accept-Language": "en-US,en;q=0.9", "Cookie": "CONSENT=YES+1; SOCS=CAI"}
+
+
+def expand(list_id):
+    """Video ids on a playlist's public page (its first ~100 entries)."""
+    try:
+        req = urllib.request.Request(f"https://www.youtube.com/playlist?list={list_id}&hl=en", headers=HEADERS)
+        html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+    except Exception:
+        return []
+    ids = re.findall(r'"playlistVideoRenderer":\{"videoId":"([\w-]{11})"', html) or re.findall(r'"videoId":"([\w-]{11})"', html)
+    return list(dict.fromkeys(ids))
 
 
 def probe(vid):
@@ -64,32 +61,17 @@ def main(args):
     moods = {k: list(v) for k, v in MOODS.items()}
     if len(args) >= 2:
         moods.setdefault(args[0], []).extend(args[1:])
-    tmp = Path(tempfile.mkdtemp())
-    (tmp / "index.html").write_text(PAGE, encoding="utf-8")
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(tmp)))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
     ids_by_mood = {}
-    with sync_playwright() as p:
-        b = p.chromium.launch()
-        pg = b.new_page()
-        pg.goto(f"http://127.0.0.1:{srv.server_port}/")
-        for mood, sources in moods.items():
-            got = []
-            for src in sources:
-                if m := re.search(r"(?:list=)?(PL[\w-]+|RD[\w-]+|OL[\w-]+)", src):
-                    for _ in range(3):  # the IFrame player sometimes returns an empty list on the first try
-                        ids = pg.evaluate("l => expand(l)", m.group(1))
-                        if ids:
-                            break
-                        pg.wait_for_timeout(1500)
-                    print(f"    {m.group(1)}: {len(ids)}")
-                    got += ids
-                elif m := re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", src):
-                    got.append(m.group(1))
-            ids_by_mood[mood] = list(dict.fromkeys(got))
-            print(f"{mood}: {len(ids_by_mood[mood])} videos")
-        b.close()
-    srv.shutdown()
+    for mood, sources in moods.items():
+        got = []
+        for src in sources:
+            if m := re.search(r"(?:list=)?((?:PL|RD|OL)[\w-]+)", src):
+                ids = expand(m.group(1))
+                print(f"    {mood:9} {m.group(1)}: {len(ids)}")
+                got += ids
+            elif m := re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", src):
+                got.append(m.group(1))
+        ids_by_mood[mood] = list(dict.fromkeys(got))
     every = sorted({i for v in ids_by_mood.values() for i in v})
     with ThreadPoolExecutor(16) as pool:
         lengths = dict(zip(every, pool.map(probe, every)))
