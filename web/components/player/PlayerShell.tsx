@@ -147,12 +147,9 @@ function ShellChrome({ skin, contained }: { skin?: SkinComponent; contained: boo
         ) : (
           <>
             {/* nightshift: the YouTube player lives in this TV; YouTube requires it to stay visible (>=200x200). */}
-            <div
-              aria-label="Now playing video"
-              style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 60, padding: 8, border: '1px solid var(--line)', borderRadius: 14, background: 'var(--bg)' }}
-            >
-              <div id="ns-tv-screen" style={{ width: 220, height: 200, borderRadius: 10, overflow: 'hidden', background: '#000' }} />
-              <div style={{ font: '10px monospace', letterSpacing: 3, color: 'var(--muted)', marginTop: 6, textTransform: 'uppercase' }}>NS-TV · CH 03</div>
+            <div aria-label="Now playing video" className="fixed right-4 bottom-4 z-[60] rounded-[14px] border border-line bg-bg p-2">
+              <div id="ns-tv-screen" className="h-[200px] w-[220px] overflow-hidden rounded-[10px] bg-black" />
+              <div className="mt-1.5 font-mono text-[10px] tracking-[3px] text-muted uppercase">NS-TV · CH 03</div>
             </div>
             {/* Contain skin suspension here so the landing page does not replay its reveal and remain at opacity 0. */}
             <Suspense fallback={null}>

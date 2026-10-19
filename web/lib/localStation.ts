@@ -10,6 +10,7 @@ import type { Theme } from '@/lib/theme';
 import type {
   NowPlayingResponse, QueueEntry, RequestResult, SchedulePayload, SessionPayload, SessionTurn, StationState,
 } from '@/lib/types';
+import SONGS from './stationSongs.json';
 import blueprint from './themes/blueprint.json';
 import classicDark from './themes/classic-dark.json';
 import classicLight from './themes/classic-light.json';
@@ -22,16 +23,16 @@ import vinyl from './themes/vinyl.json';
 export const STATION_NAME = 'nightshift radio';
 export const THEMES = [blueprint, classicDark, classicLight, cyberpunk, flare, recon, signal, vinyl] as Theme[];
 const TZ = 'Asia/Kolkata';
+const EPOCH = Date.UTC(2026, 0, 1);
+const SLOT_MS = 165_000; // 2:45 radio-edit slot per song on the shared clock
 
-// Punjabi hit playlists seed the library; YouTube Mix of liked songs keeps adding fresh ones.
-const PLAYLISTS = ['PLNCA1T91UH31M7mN8iKSxMwwWB_mkzwT6', 'PL6_AX-gRSOpuWInKGtQUJuF7QWabStH9j', 'PLO7-VO1D0_6NYoMAN0XncJu4tvibirSmN',
-  'PLhGslrRCBNB_3kz5lgkOTWwxPiio-CXk_', 'PLkCEdVkZvreMnWmY3GhgmKhPD3pnbp6Tv', 'PL-QvSRz8uhNHYPsQFUyZ4vEDURCBqLiR1', 'PLHvybnsTYyfX336Tn6Pych7U_uDuMNZIL'];
+// stationSongs.json: ~680 Punjabi hits harvested once from public YouTube playlists.
 
 // ---------- shows & hosts (hour-of-day schedule) ----------
 const PERSONAS = [
   { id: 'meher', name: 'Meher', tagline: 'morning chai, soft starts', avatar: '' },
   { id: 'heer', name: 'Heer', tagline: 'focus, calm, flow', avatar: '' },
-  { id: 'kabir', name: 'Kabir', tagline: 'windows down, volume up', avatar: '' },
+  { id: 'kabir', name: 'Love', tagline: 'windows down, volume up', avatar: '' },
   { id: 'noor', name: 'Noor', tagline: 'after-dark selector', avatar: '' },
 ];
 const SHOWS = [
@@ -53,7 +54,7 @@ const LINES: Record<string, string[]> = {
 
 // ---------- saved taste ----------
 interface Song { title: string; likes: number; plays: number }
-interface Saved { songs: Record<string, Song>; banned: string[]; seeded?: boolean; volume?: number }
+interface Saved { songs: Record<string, Song>; banned: string[]; seeded?: boolean; volume?: number; seedIds?: string[] }
 const KEY = 'nightshift-radio';
 const load = (): Saved => { try { return { songs: {}, banned: [], ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch { return { songs: {}, banned: [] }; } };
 
@@ -88,7 +89,6 @@ export type EngineStatus = 'idle' | 'connecting' | 'playing' | 'paused';
 
 class LocalStation {
   private saved: Saved = { songs: {}, banned: [] };
-  private player: YTPlayer | null = null;
   private yt: YTNs | null = null;
   private subs = new Set<() => void>();
   private mix: string[] = [];
@@ -101,6 +101,7 @@ class LocalStation {
   private requests = new Map<string, RequestResult>();
   private weather: { condition?: string; temp?: number; location?: string } = {};
   private started = false;
+  private seeding: Promise<void> = Promise.resolve();
 
   init() {
     if (this.started || typeof window === 'undefined') return;
@@ -109,6 +110,7 @@ class LocalStation {
     this.volume = this.saved.volume ?? 0.8;
     this.fetchWeather();
     this.say(`Station's warm. ${STATION_NAME}, ${currentShow().name} with ${personaOf().name}. Press play whenever you're ready.`, false);
+    this.seeding = this.seed();
   }
   subscribe(fn: () => void) { this.subs.add(fn); return () => { this.subs.delete(fn); }; }
   private emit() { this.subs.forEach(f => f()); }
@@ -125,34 +127,57 @@ class LocalStation {
     navigator.geolocation?.getCurrentPosition(p => go(p.coords.latitude, p.coords.longitude, ''), () => go(28.61, 77.21, 'Delhi'), { timeout: 5000 });
   }
 
-  // The visible TV element is created by PlayerShell; the player mounts into it.
+  // ---------- two-deck player: the next song is cued on the idle deck and crossfaded in ----------
+  // Both decks live inside the visible TV (YouTube terms); the live deck sits on top.
+  private decks: YTPlayer[] = [];
+  private live = 0;
+  private deckEls: HTMLElement[] = [];
+  private get player(): YTPlayer | null { return this.decks[this.live] ?? null; }
   private async ensurePlayer(): Promise<YTPlayer | null> {
-    if (this.player) return this.player;
+    if (this.decks.length) return this.player;
     const host = document.getElementById('ns-tv-screen');
     if (!host) return null;
+    host.style.position = 'relative';
     this.yt = await loadYT();
-    const mount = document.createElement('div'); host.appendChild(mount);
-    await new Promise<void>(res => {
-      this.player = new this.yt!.Player(mount, {
-        width: '100%', height: '100%', playerVars: { controls: 0, rel: 0, playsinline: 1, disablekb: 1 },
-        events: {
-          onReady: () => res(),
-          onStateChange: (e: { data: number }) => this.onState(e.data),
-          onError: () => { if (this.current) this.saved.banned.push(this.current.id); this.save(); void this.next(false); },
-        },
+    for (let i = 0; i < 2; i++) {
+      const wrap = document.createElement('div'); wrap.style.cssText = 'position:absolute;inset:0;transition:opacity 1.2s';
+      const mount = document.createElement('div'); wrap.appendChild(mount); host.appendChild(wrap); this.deckEls.push(wrap);
+      await new Promise<void>(res => {
+        this.decks[i] = new this.yt!.Player(mount, {
+          width: '100%', height: '100%', playerVars: { controls: 0, rel: 0, playsinline: 1, disablekb: 1 },
+          events: { onReady: () => res(), onStateChange: (e: { data: number }) => this.onState(i, e.data), onError: () => this.onDeckError(i) },
+        });
       });
-    });
-    this.player!.setVolume(Math.round(this.volume * 100));
-    void this.seed();
+    }
+    this.showDeck(0);
     return this.player;
   }
+  private showDeck(i: number) { this.deckEls.forEach((el, k) => { el.style.opacity = k === i ? '1' : '0'; el.style.zIndex = k === i ? '2' : '1'; }); }
+  private deckVol = [1, 1];
+  private setDeckVol(i: number, v: number) { this.deckVol[i] = v; const d = this.decks[i]; if (d && typeof d.setVolume === 'function') d.setVolume(Math.round(v * this.volume * 100)); }
+  private ramp(i: number, to: number, ms: number): Promise<void> {
+    const from = this.deckVol[i] ?? 1, steps = Math.max(1, Math.round(ms / 80));
+    return new Promise(res => { let k = 0; const t = setInterval(() => { k++; this.setDeckVol(i, from + (to - from) * (k / steps)); if (k >= steps) { clearInterval(t); res(); } }, 80); });
+  }
 
-  private onState(s: number) {
+  private onState(deck: number, s: number) {
+    if (deck !== this.live) return;
     const S = this.yt!.PlayerState;
     if (s === S.PLAYING) { this.status = 'playing'; this.onPlaying(); }
-    else if (s === S.PAUSED && this.status === 'playing') this.status = 'paused';
-    else if (s === S.ENDED) { void this.next(true); return; }
+    else if (s === S.PAUSED && this.status === 'playing' && !this.fading) this.status = 'paused';
+    else if (s === S.ENDED) { this.onEnded(); return; }
     this.emit();
+  }
+  private onDeckError(deck: number) {
+    // Unplayable embed: every listener hits the same wall, so all fall back to the same neighbour.
+    if (deck !== this.live || !this.current) return;
+    this.saved.banned.push(this.current.id); this.save();
+    void this.crossTo(this.slot().next, 0, false);
+  }
+  private onEnded() {
+    // Request finished: rejoin the broadcast. Song shorter than its slot: the DJ fills the gap.
+    if (this.onRequest) { void this.crossTo(this.slot().id, this.slot().offset, true); return; }
+    if (this.slot().msLeft > 4000) void this.say(this.link(this.current, this.slot().next));
   }
 
   private onPlaying() {
@@ -167,18 +192,12 @@ class LocalStation {
       if (this.history[0]?.subsonic_id !== id) this.history.unshift({ title, artist, subsonic_id: id, startedAt: this.current.startedAt });
       this.history = this.history.slice(0, 30);
       this.cue();
+      if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title, artist, album: STATION_NAME,
+        artwork: [{ src: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, sizes: '480x360', type: 'image/jpeg' }] });
     } else if (!this.current!.title) this.current = { ...this.current!, title, artist };
   }
 
-  private pick(): string {
-    if (this.mix.length && Math.random() < 0.35) return this.mix.shift()!;
-    const recent = new Set(this.history.slice(0, 8).map(h => h.subsonic_id));
-    const pool = Object.entries(this.saved.songs).filter(([id]) => !this.saved.banned.includes(id) && !recent.has(id) && id !== this.current?.id);
-    let r = Math.random() * pool.reduce((t, [, s]) => t + 1 + s.likes * 3, 0);
-    for (const [id, s] of pool) if ((r -= 1 + s.likes * 3) <= 0) return id;
-    return pool[0]?.[0] || 'kJQP7kiw5Fk';
-  }
-  private cue() { if (!this.upcoming.length) this.upcoming.push(this.pick()); void this.fillTitle(this.upcoming[0]); }
+  private cue() { const n = this.slot().next; if (!this.upcoming.includes(n)) this.upcoming.push(n); void this.fillTitle(n); }
   // Free, keyless title lookup so cued/history rows show real names before the song airs.
   private async fillTitle(id?: string) {
     if (!id) return; const s = (this.saved.songs[id] ??= { title: '', likes: 0, plays: 0 });
@@ -193,39 +212,97 @@ class LocalStation {
     this.messages = this.messages.slice(-40); this.emit();
     if (!speak || typeof speechSynthesis === 'undefined') return Promise.resolve();
     return new Promise(res => {
-      const u = new SpeechSynthesisUtterance(text); u.rate = 1; u.pitch = 0.9; u.volume = this.volume;
-      u.onend = u.onerror = () => res(); speechSynthesis.cancel(); speechSynthesis.speak(u); setTimeout(res, 14000);
+      const u = new SpeechSynthesisUtterance(text); u.rate = 1.02; u.pitch = 0.9; u.volume = Math.min(1, this.volume + 0.15);
+      const v = speechSynthesis.getVoices(); u.voice = v.find(x => /en-IN/.test(x.lang)) || v.find(x => /en-GB/.test(x.lang)) || null;
+      u.onend = u.onerror = () => res(); speechSynthesis.cancel(); speechSynthesis.speak(u); setTimeout(res, 12000);
     });
   }
   private link(prev: QueueEntry | null, nextId: string) {
     const s = currentShow(), lines = LINES[s.id] ?? [''], line = lines[Math.floor(Math.random() * lines.length)] ?? '';
-    const when = new Date().toLocaleString('en-IN', { hour: 'numeric', minute: '2-digit', weekday: 'long', timeZone: TZ });
-    const sky = this.weather.temp != null ? `, ${this.weather.temp} degrees and ${this.weather.condition}` : '';
+    const when = new Date().toLocaleString('en-IN', { hour: 'numeric', minute: '2-digit', timeZone: TZ });
+    const sky = this.weather.temp != null && Math.random() < 0.4 ? ` ${this.weather.temp} degrees outside.` : '';
     const n = parseTitle(this.saved.songs[nextId]?.title);
-    return `${when}${sky}. ${prev?.title ? `That was ${prev.title}. ` : ''}${line}${n.artist ? ` Here's ${n.artist}.` : ''}`;
+    const lead = Math.random() < 0.5 && prev?.title ? `That was ${prev.title}.` : `${when} on ${STATION_NAME}.`;
+    return `${lead}${sky} ${line}${n.artist ? ` Up next, ${n.artist}.` : ''}`;
   }
+
+  // ---------- shared clock: every listener hears the same song at the same moment ----------
+  private schedList(): string[] {
+    const ids = [...(SONGS as string[])]; // fixed, shipped list: identical on every device
+    let seed = Math.floor((Date.now() - EPOCH) / 86400000) + 1;
+    const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+    for (let i = ids.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [ids[i], ids[j]] = [ids[j]!, ids[i]!]; }
+    return ids;
+  }
+  private slot(at = Date.now()) {
+    const list = this.schedList(), n = Math.floor((at - EPOCH) / SLOT_MS);
+    return { id: list.length ? list[n % list.length]! : 'kJQP7kiw5Fk', next: list.length ? list[(n + 1) % list.length]! : '',
+      offset: ((at - EPOCH) % SLOT_MS) / 1000, msLeft: SLOT_MS - ((at - EPOCH) % SLOT_MS) };
+  }
+  private boundary: ReturnType<typeof setTimeout> | null = null;
+  private preroll: ReturnType<typeof setTimeout> | null = null;
+  private onRequest = false;
+  private fading = false;
 
   async tune() {
     this.init(); const resume = !!this.current && this.status === 'paused'; this.status = 'connecting'; this.emit();
     const p = await this.ensurePlayer(); if (!p) return;
     if (resume) { p.playVideo(); return; }
-    await this.say(`You're listening to ${STATION_NAME}. ${currentShow().name} with ${personaOf().name}.`);
-    await this.next(false, true);
+    await this.seeding;
+    // One tap and you're in: join the broadcast mid-song with a soft fade-in, no intro chatter.
+    const sl = this.slot();
+    this.setDeckVol(this.live, 0);
+    this.load(this.live, sl.id, sl.offset);
+    void this.ramp(this.live, 1, 2500);
+    this.arm();
   }
-  async next(talk: boolean, join = false) {
-    const p = this.player; if (!p) return;
-    const prev = this.current; if (prev) { const h = this.history.find(x => x.subsonic_id === prev.id); if (h) h.endedAt = iso(); }
-    const id = this.upcoming.shift() || this.pick();
-    if (talk) { p.pauseVideo(); await this.say(this.link(prev, id)); }
-    this.current = { id, subsonic_id: id }; this.emit();
-    p.loadVideoById(id);
-    if (join) setTimeout(() => { const d = p.getDuration(); if (d > 90) (p as unknown as { seekTo(s: number, a: boolean): void }).seekTo(Math.floor(d * (0.15 + Math.random() * 0.4)), true); }, 2500);
+  private load(deck: number, id: string, at: number) {
+    this.current = { id, subsonic_id: id }; this.onRequest = false; this.emit();
+    (this.decks[deck] as unknown as { loadVideoById(o: { videoId: string; startSeconds: number }): void }).loadVideoById({ videoId: id, startSeconds: Math.floor(at) });
+  }
+  /** Schedule the next handover: cue the idle deck early, then crossfade on the slot boundary. */
+  private arm() {
+    if (this.boundary) clearTimeout(this.boundary);
+    if (this.preroll) clearTimeout(this.preroll);
+    const sl = this.slot();
+    this.preroll = setTimeout(() => {
+      const idle = 1 - this.live; this.setDeckVol(idle, 0);
+      (this.decks[idle] as unknown as { cueVideoById(o: { videoId: string; startSeconds: number }): void }).cueVideoById({ videoId: sl.next, startSeconds: 0 });
+    }, Math.max(0, sl.msLeft - 15000));
+    this.boundary = setTimeout(() => void this.crossTo(this.slot().id, 0, true), sl.msLeft);
+  }
+  /** Crossfade from the live deck to `id` on the idle deck; the DJ talks over the blend. */
+  private async crossTo(id: string, at: number, talk: boolean) {
+    if (this.status === 'idle' || this.decks.length < 2) return;
+    const prev = this.current, from = this.live, to = 1 - from;
+    if (prev) { const h = this.history.find(x => x.subsonic_id === prev.id); if (h) h.endedAt = iso(); }
+    this.fading = true;
+    this.setDeckVol(to, 0);
+    this.live = to; this.load(to, id, at);
+    this.showDeck(to);
+    const talking = talk ? this.say(this.link(prev, id)) : Promise.resolve();
+    await Promise.all([this.ramp(from, 0, 3000), this.ramp(to, talk ? 0.35 : 1, 2500)]);
+    this.decks[from]?.stopVideo(); this.fading = false;
+    await talking; await this.ramp(to, 1, 1800);
+    this.arm();
+  }
+  /** Skip / request: a request crossfades in; otherwise rejoin the broadcast where it is now. */
+  async next(_talk = false) {
+    const req = this.upcoming.find(x => x !== this.slot().next);
+    if (req) { this.upcoming = this.upcoming.filter(x => x !== req); await this.crossTo(req, 0, true); this.onRequest = true; return; }
+    await this.crossTo(this.slot().id, this.slot().offset, false);
   }
   play() { this.player?.playVideo(); }
   pause() { this.player?.pauseVideo(); this.status = 'paused'; this.emit(); }
-  stop() { this.player?.stopVideo(); speechSynthesis?.cancel(); this.status = 'idle'; this.emit(); }
-  setVolume(v: number) { this.volume = Math.max(0, Math.min(1, v)); this.player?.setVolume(Math.round(this.volume * 100)); this.save(); this.emit(); }
-  elapsed() { return this.player?.getCurrentTime() || 0; }
+  stop() {
+    this.decks.forEach(d => d.stopVideo());
+    if (this.boundary) clearTimeout(this.boundary);
+    if (this.preroll) clearTimeout(this.preroll);
+    if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+    this.status = 'idle'; this.current = null; this.emit();
+  }
+  setVolume(v: number) { this.volume = Math.max(0, Math.min(1, v)); this.decks.forEach((_, i) => this.setDeckVol(i, this.deckVol[i] ?? 1)); this.save(); this.emit(); }
+  elapsed() { const p = this.player; return p && typeof p.getCurrentTime === 'function' ? p.getCurrentTime() || 0 : 0; }
 
   like(songId: string) {
     const s = this.saved.songs[songId]; if (!s) return { ok: false, error: 'no track' };
@@ -263,11 +340,9 @@ class LocalStation {
       } } });
     });
   }
-  private async seed() {
-    if (this.saved.seeded && Object.keys(this.saved.songs).length > 50) return;
-    for (const pl of PLAYLISTS) (await this.harvest(pl)).forEach(id => (this.saved.songs[id] ??= { title: '', likes: 0, plays: 0 }));
-    this.saved.seeded = true; this.save(); this.emit();
-  }
+  private async seed() { (SONGS as string[]).forEach(id => (this.saved.songs[id] ??= { title: '', likes: 0, plays: 0 })); this.save(); }
+
+
 
   // ---------- controller-shaped payloads ----------
   nowPlaying(): NowPlayingResponse {
