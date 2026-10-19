@@ -6,9 +6,38 @@
 import { useEffect, useRef, useState } from 'react';
 import { station } from '@/lib/localStation';
 
-type Tab = 'lyrics' | 'dedicate' | 'timer' | 'history' | 'wrapped' | null;
-const TABS: [Exclude<Tab, null>, string][] = [['lyrics', 'Lyrics'], ['dedicate', 'Dedicate'], ['timer', 'Sleep'], ['history', '24h'], ['wrapped', 'Wrapped']];
+type Tab = 'search' | 'lyrics' | 'dedicate' | 'timer' | 'history' | 'wrapped' | null;
+const TABS: [Exclude<Tab, null>, string][] = [['search', 'Search'], ['lyrics', 'Lyrics'], ['dedicate', 'Dedicate'], ['timer', 'Sleep'], ['history', '24h'], ['wrapped', 'Wrapped']];
 const btn = 'rounded-md border border-line px-1.5 py-0.5 hover:border-ink';
+
+function Search() {
+  const [q, setQ] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [hits, setHits] = useState<{ id: string; title: string; channel: string; length: string }[] | null>(null);
+  const go = async (e: React.FormEvent) => { e.preventDefault(); if (!q.trim()) return; setBusy(true); setHits(await station.search(q)); setBusy(false); };
+  return (
+    <div className="flex flex-col gap-2">
+      <form onSubmit={go} className="flex gap-1">
+        <input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="song or artist, e.g. Brown Munde"
+          className="min-w-0 flex-1 rounded-md border border-line bg-bg px-2 py-1 text-ink" />
+        <button className={btn}>{busy ? '…' : 'Go'}</button>
+      </form>
+      {hits && !hits.length && <p>Nothing found. Try another spelling.</p>}
+      <ul className="max-h-60 overflow-y-auto pr-1">
+        {hits?.map(h => (
+          <li key={h.id}>
+            <button onClick={() => void station.playNow(h.id, h.title)} className="flex w-full items-center gap-2 border-b border-line py-1 text-left hover:text-ink">
+              <img src={`https://i.ytimg.com/vi/${h.id}/default.jpg`} alt="" className="h-8 w-11 shrink-0 rounded object-cover" />
+              <span className="min-w-0 flex-1"><span className="block truncate text-ink">{h.title}</span><span className="block truncate">{h.channel} · {h.length}</span></span>
+              <span className="shrink-0">▶</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+      <p className="text-muted">Tap to play now. It also joins My Station.</p>
+    </div>
+  );
+}
 
 function Lyrics() {
   const [lines, setLines] = useState<{ t: number; l: string }[] | null | undefined>(undefined);
@@ -111,7 +140,7 @@ export default function NsExtras() {
     <div className="relative z-30 mt-1.5 font-mono text-[10px] tracking-[1px] text-muted">
       {tab && (
         <div className="absolute right-0 bottom-full z-30 mb-2 w-72 rounded-xl border border-line bg-bg p-3 text-[11px] normal-case shadow-xl">
-          {tab === 'lyrics' && <Lyrics />}{tab === 'dedicate' && <Dedicate />}{tab === 'timer' && <Timer />}
+          {tab === 'search' && <Search />}{tab === 'lyrics' && <Lyrics />}{tab === 'dedicate' && <Dedicate />}{tab === 'timer' && <Timer />}
           {tab === 'history' && <History />}{tab === 'wrapped' && <Wrapped />}
         </div>
       )}

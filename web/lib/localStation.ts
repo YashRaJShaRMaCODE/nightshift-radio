@@ -244,7 +244,10 @@ class LocalStation {
       if (this.history[0]?.subsonic_id !== id) this.history.unshift({ title, artist, subsonic_id: id, startedAt: this.current.startedAt });
       this.history = this.history.slice(0, 30);
       this.cue();
-      if (this.mood === 'mine' && !this.onRequest) this.arm();
+      if (this.mood === 'mine' && !this.onRequest) {
+        this.arm();
+        void this.harvest('RD' + id).then(ids => { if (this.current?.id === id) { this.chain = ids.filter(x => x !== id).slice(0, 20); this.mineNext = ''; this.cue(); } });
+      }
       if ('mediaSession' in navigator) {
         const ms = navigator.mediaSession;
         ms.metadata = new MediaMetadata({ title, artist: artist || moodLabel(this.mood), album: `${STATION_NAME} · ${moodLabel(this.mood)}`,
@@ -308,8 +311,13 @@ class LocalStation {
     return [...new Set([...(this.saved.mine ?? []), ...liked, ...(this.saved.mix ?? [])])].filter(id => !this.saved.banned.includes(id));
   }
   private mineNext = '';
+  /** Up-next candidates from the YouTube Mix of the song on air (refreshed on every My Station song). */
+  private chain: string[] = [];
   private pickMine(): string {
-    const recent = new Set(this.history.slice(0, 12).map(h => h.subsonic_id).concat(this.current?.id ?? ''));
+    const recent = new Set(this.history.slice(0, 15).map(h => h.subsonic_id).concat(this.current?.id ?? ''));
+    const chained = this.chain.filter(id => !recent.has(id) && !this.saved.banned.includes(id));
+    // Mostly follow the chain (fresh, similar songs); every few songs return to your own picks.
+    if (chained.length && Math.random() < 0.65) return chained[Math.floor(Math.random() * Math.min(5, chained.length))]!;
     const pool = this.minePool().filter(id => !recent.has(id));
     if (!pool.length) return onAir(moodList('trending'), this.now(), 2)?.next ?? 'kJQP7kiw5Fk';
     // Your own playlists and likes weigh more than fresh Mix discoveries.
@@ -472,6 +480,21 @@ class LocalStation {
     const topId = top(x => x.id);
     return { songs: log.length, hours: Math.round((secs / 3600) * 10) / 10, minutes: Math.round(secs / 60), artist: top(x => this.title(x.id).artist), mood: moodLabel(top(x => x.mood)),
       song: topId ? this.title(topId).title : '' };
+  }
+
+  /** Song search through the server (YouTube results page, no key). */
+  async search(q: string): Promise<{ id: string; title: string; channel: string; length: string }[]> {
+    try { const r = await fetch(`/ns/search?q=${encodeURIComponent(q)}`, { signal: AbortSignal.timeout(9000) }); return ((await r.json()) as { results?: [] }).results ?? []; }
+    catch { return []; }
+  }
+  /** Play a searched song right away: in My Station it joins your station; elsewhere it plays once, then the broadcast resumes. */
+  async playNow(id: string, title = '') {
+    this.saved.songs[id] ??= { title, likes: 0, plays: 0 };
+    if (title && !this.saved.songs[id]!.title) this.saved.songs[id]!.title = title;
+    this.saved.mine = [...new Set([id, ...(this.saved.mine ?? [])])]; this.save();
+    if (this.status === 'idle' || !this.decks.length) { if (this.mood !== 'mine') this.setMood('mine'); this.mineNext = id; await this.tune(); return; }
+    if (this.mood === 'mine') { await this.crossTo(id, 0, false, `Here's ${parseTitle(title).title || 'your pick'}.`); return; }
+    this.upcoming.unshift(id); await this.next();
   }
 
   play() { void this.tune(); }
