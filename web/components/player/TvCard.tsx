@@ -78,7 +78,9 @@ export default function TvCard() {
           <div className="flex shrink-0 gap-1">
             <button onClick={() => (station.status === 'playing' ? station.pause() : void station.tune())} className="rounded-md border border-line px-2 py-1 text-ink hover:border-ink" aria-label="Play or pause">
               {station.status === 'playing' ? '❚❚' : '▶'}</button>
-            <button onClick={() => void station.next()} className="rounded-md border border-line px-2 py-1 text-ink hover:border-ink" aria-label="Next">⏭</button>
+            {station.canSkip && <button onClick={() => void station.previous()} className="rounded-md border border-line px-2 py-1 text-ink hover:border-ink" aria-label="Previous song">⏮</button>}
+            <button onClick={() => void station.refresh()} disabled={station.status !== 'playing'} className="rounded-md border border-line px-2 py-1 text-ink hover:border-ink disabled:opacity-40" aria-label="Refresh: swap this song" title="Don't like this song? Swap it">↻</button>
+            {station.canSkip && <button onClick={() => void station.next()} className="rounded-md border border-line px-2 py-1 text-ink hover:border-ink" aria-label="Next song">⏭</button>}
             <button onClick={togglePocket} className="rounded-md border border-line px-2 py-1 text-ink hover:border-ink" aria-label="Leave pocket mode">⤢</button>
           </div>
         </div>
@@ -109,6 +111,11 @@ export default function TvCard() {
       </div>
       <div className={mini || pocket ? 'hidden' : ''}><MoodPicker /></div>
       <div id="ns-tv-screen" className="h-[200px] w-[200px] overflow-hidden rounded-lg bg-black" />
+      <div className={mini || pocket ? 'hidden' : 'mt-1 flex gap-1 font-mono text-[10px] tracking-[2px] text-muted uppercase'}>
+        {station.canSkip && <button onClick={() => void station.previous()} className="rounded border border-line px-2 py-1 hover:border-ink hover:text-ink" aria-label="Previous song" title="Previous song">⏮</button>}
+        <button onClick={() => void station.refresh()} disabled={station.status !== 'playing'} className="flex-1 rounded border border-line px-2 py-1 hover:border-ink hover:text-ink disabled:opacity-40" aria-label="Refresh: swap this song" title="Don't like this song? Swap it">↻ Refresh</button>
+        {station.canSkip && <button onClick={() => void station.next()} className="rounded border border-line px-2 py-1 hover:border-ink hover:text-ink" aria-label="Next song" title="Next song">⏭</button>}
+      </div>
       <div className={mini || pocket ? 'hidden' : ''}><NsExtras /></div>
     </div>
     </>

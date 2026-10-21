@@ -155,7 +155,7 @@ class LocalStation {
   }
   setMood(m: string) {
     if (m === this.mood || !MOODS.some(x => x[0] === m)) return;
-    this.mood = m; this.saved.mood = m; this.save(); this.upcoming = []; this.emit();
+    this.mood = m; this.saved.mood = m; this.save(); this.upcoming = []; this.shift = 0; this.back = []; this.emit();
     if (m === 'local') { if (this.status !== 'idle') { this.decks.forEach(d => d.stopVideo()); if (this.boundary) clearTimeout(this.boundary); if (this.preroll) clearTimeout(this.preroll); void this.localNext(false); } return; }
     if (this.localCur) { this.stopLocal(); if (this.status !== 'idle') { this.status = 'connecting'; void this.tune(); } return; }
     if (this.status !== 'idle' && this.decks.length) {
@@ -348,9 +348,15 @@ class LocalStation {
       return { id: this.mineNext, next: this.mineNext, offset: 0, msLeft: this.mineLeft(), nextD: 0, index: 0 };
     }
     const salt = MOODS.findIndex(x => x[0] === this.mood) + 1;
-    const a = onAir(moodList(this.mood), this.now(), salt);
+    const a = onAir(moodList(this.mood), this.now() + this.shift, salt);
     return a ?? { id: 'kJQP7kiw5Fk', next: 'kJQP7kiw5Fk', offset: 0, msLeft: 180000, nextD: 180, index: 0 };
   }
+  /** Personal time shift (ms) added by Refresh in a radio mood. Reset on every mood change, which re-syncs with everyone. */
+  private shift = 0;
+  /** Songs already played in My Station, newest last, for Previous. `curMood` is the mood the on-air song was loaded under. */
+  private back: string[] = [];
+  private going = false;
+  private curMood = '';
   private boundary: ReturnType<typeof setTimeout> | null = null;
   private preroll: ReturnType<typeof setTimeout> | null = null;
   private onRequest = false;
@@ -424,6 +430,8 @@ class LocalStation {
   }
   private load(deck: number, id: string, at: number) {
     if (id === this.mineNext) this.mineNext = '';
+    if (this.mood === 'mine' && this.curMood === 'mine' && !this.going && this.current && this.current.id !== id) { this.back.push(this.current.id); if (this.back.length > 50) this.back.shift(); }
+    this.curMood = this.mood;
     this.current = { id, subsonic_id: id }; this.onRequest = false; this.emit();
     (this.decks[deck] as unknown as { loadVideoById(o: { videoId: string; startSeconds: number }): void }).loadVideoById({ videoId: id, startSeconds: Math.floor(at) });
   }
@@ -462,6 +470,27 @@ class LocalStation {
     if (req) { this.upcoming = this.upcoming.filter(x => x !== req); await this.crossTo(req, 0, true); this.onRequest = true; return; }
     if (this.mood === 'mine') { await this.crossTo(this.pickMine(), 0, false); return; }
     const sl = this.slot(); await this.crossTo(sl.id, sl.offset, false);
+  }
+  /** Next / Previous exist only in My Station. A radio mood is one broadcast everyone shares, so it has no skip. */
+  get canSkip() { return this.mood === 'mine'; }
+  /** Refresh: don't like this song? Swap it. My Station and Offline pick another one; a radio mood hops to the
+   *  following song of its loop for this listener only (the shift is dropped when the mood changes). */
+  async refresh() {
+    if (this.status !== 'playing' || this.fading) return;
+    if (this.mood === 'local' || this.mood === 'mine') { await this.next(); return; }
+    this.shift += this.slot().msLeft + 50;
+    const sl = this.slot();
+    await this.crossTo(sl.id, sl.offset, false);
+  }
+  /** Previous song in My Station; with nothing behind it, restarts the current one. */
+  async previous() {
+    if (this.mood !== 'mine' || this.status === 'idle' || this.fading) return;
+    const id = this.back.pop();
+    if (!id) { (this.player as unknown as { seekTo?(t: number, a: boolean): void } | null)?.seekTo?.(0, true); return; }
+    this.going = true;
+    const done = this.crossTo(id, 0, false);   // crossTo calls load() before its first await, so the flag only needs to cover this call
+    this.going = false;
+    await done;
   }
   private userPaused = false;
   // Keep the screen (and with it the tab) awake while the station is on air.
